@@ -22,7 +22,8 @@ Built for GNOME Shell **45 / 46 / 47** (Ubuntu 23.10+, Fedora 39+, and other mod
 
 ## Screenshots
 
-![Texte alternatif](App-manager-remover.png "Extension Screeshot")
+> *Add screenshots of the floating panel, filter buttons, and confirmation dialog here.*
+
 ---
 
 ## Installation
@@ -118,8 +119,8 @@ The extension uses `apt remove` (not `apt purge`) so configuration files are pre
         │   clicks to close)  │
         └──────────┬──────────┘
                    │
-    ┌──────────────▼─────────────┐
-    │    AppManagerWindow        │
+    ┌──────────────▼──────────────┐
+    │    AppManagerWindow         │
     │  ┌────────────────────┐    │
     │  │ Header + Close btn │    │
     │  ├────────────────────┤    │

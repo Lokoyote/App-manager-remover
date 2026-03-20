@@ -1,0 +1,180 @@
+/* ═══════════════════════════════════════════════════════════════
+ *  App Manager — GNOME Shell Extension Stylesheet
+ *
+ *  Styles the floating application window, search bar, filter
+ *  buttons, app rows, source badges, and confirmation dialog.
+ *  All colors use GNOME Shell's dark palette conventions.
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* ── Floating window container ────────────────────────────────── */
+
+.app-manager-window {
+    background-color: #2d2d2d;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 16px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    padding: 0;
+}
+
+/* ── Header bar ───────────────────────────────────────────────── */
+
+.app-manager-header {
+    padding: 16px 18px 10px 18px;
+    spacing: 8px;
+}
+
+.app-manager-title {
+    font-size: 17px;
+    font-weight: bold;
+    color: #ffffff;
+}
+
+/* Close button (top-right corner) */
+.app-manager-close-btn {
+    border-radius: 50%;
+    padding: 4px;
+    width: 28px;
+    height: 28px;
+    background-color: rgba(255, 255, 255, 0.08);
+    color: #aaaaaa;
+}
+
+.app-manager-close-btn:hover {
+    background-color: rgba(255, 255, 255, 0.16);
+    color: #ffffff;
+}
+
+/* ── Search entry ─────────────────────────────────────────────── */
+
+.app-manager-search {
+    margin: 4px 16px 8px 16px;
+    padding: 8px 14px;
+    border-radius: 10px;
+    font-size: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background-color: rgba(255, 255, 255, 0.06);
+    color: #eeeeee;
+    selection-background-color: rgba(98, 160, 234, 0.4);
+}
+
+.app-manager-search:focus {
+    border-color: rgba(98, 160, 234, 0.5);
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+/* ── Source filter buttons (All / Deb / Flatpak / Snap) ───────── */
+
+.app-manager-filters {
+    padding: 2px 16px 6px 16px;
+    spacing: 6px;
+}
+
+.app-manager-filter-btn {
+    border-radius: 16px;
+    padding: 5px 16px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #bbbbbb;
+    background-color: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    transition-duration: 150ms;
+}
+
+.app-manager-filter-btn:hover {
+    background-color: rgba(255, 255, 255, 0.12);
+    color: #ffffff;
+}
+
+.app-manager-filter-btn:checked {
+    background-color: rgba(98, 160, 234, 0.3);
+    color: #ffffff;
+    border-color: rgba(98, 160, 234, 0.5);
+}
+
+/* ── App count label ──────────────────────────────────────────── */
+
+.app-manager-count {
+    font-size: 11px;
+    color: #777777;
+    padding: 2px 20px 6px 20px;
+}
+
+/* ── Scrollable list area ─────────────────────────────────────── */
+
+.app-manager-scroll {
+    padding: 0 4px 8px 4px;
+}
+
+.app-manager-list {
+    spacing: 1px;
+    padding: 0 4px;
+}
+
+/* ── Individual app row ───────────────────────────────────────── */
+
+.app-manager-row {
+    padding: 8px 14px;
+    spacing: 12px;
+    border-radius: 10px;
+    transition-duration: 100ms;
+}
+
+.app-manager-row:hover {
+    background-color: rgba(255, 255, 255, 0.06);
+}
+
+/* ── App name label ───────────────────────────────────────────── */
+
+.app-manager-app-name {
+    font-size: 14px;
+    font-weight: 500;
+    color: #eeeeee;
+}
+
+/* ── Source badges (colored pills below the app name) ─────────── */
+
+.app-manager-badge {
+    font-size: 9px;
+    font-weight: 700;
+    padding: 1px 8px;
+    border-radius: 8px;
+    color: #ffffff;
+}
+
+/* Deb — Ubuntu orange */
+.app-manager-badge-deb {
+    background-color: rgba(233, 84, 32, 0.55);
+}
+
+/* Flatpak — green */
+.app-manager-badge-flatpak {
+    background-color: rgba(78, 154, 6, 0.55);
+}
+
+/* Snap — purple */
+.app-manager-badge-snap {
+    background-color: rgba(114, 86, 209, 0.55);
+}
+
+/* ── Uninstall button (trash icon, right side of each row) ────── */
+
+.app-manager-uninstall-btn {
+    border-radius: 8px;
+    padding: 6px;
+    background-color: transparent;
+    transition-duration: 150ms;
+    color: #888888;
+}
+
+.app-manager-uninstall-btn:hover {
+    background-color: rgba(224, 27, 36, 0.25);
+    color: #ff6b6b;
+}
+
+/* ── Confirmation dialog ──────────────────────────────────────── */
+
+.app-manager-confirm-dialog .modal-dialog {
+    background-color: #3a3a3a;
+    border-radius: 16px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}

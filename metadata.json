@@ -1,0 +1,8 @@
+{
+  "name": "App Manager Remover",
+  "description": "A unified application manager that lists user-installed apps from Flatpak, Snap, and Deb sources with one-click uninstall. Hides system components using a 6-layer filtering strategy. Uninstallation is confirmed via a modal dialog and authenticated through pkexec (PolicyKit).",
+  "uuid": "app-manager-remover@lokoyote.eu",
+  "shell-version": ["45", "46", "47"],
+  "version": 1,
+  "url": "https://github.com/YOUR_USERNAME/gnome-app-manager"
+}
