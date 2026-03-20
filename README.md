@@ -44,10 +44,10 @@ Then restart GNOME Shell:
 ### Manual Installation
 
 ```bash
-EXT_DIR="$HOME/.local/share/gnome-shell/extensions/app-manager@custom"
+EXT_DIR="$HOME/.local/share/gnome-shell/extensions/app-manager-remover@lokoyote.eu"
 mkdir -p "$EXT_DIR"
 cp metadata.json extension.js stylesheet.css "$EXT_DIR/"
-gnome-extensions enable app-manager@custom
+gnome-extensions enable app-manager-remover@lokoyote.eu
 ```
 
 ---
@@ -62,8 +62,8 @@ chmod +x uninstall.sh
 Or manually:
 
 ```bash
-gnome-extensions disable app-manager@custom
-rm -rf ~/.local/share/gnome-shell/extensions/app-manager@custom
+gnome-extensions disable app-manager-remover@lokoyote.eu
+rm -rf ~/.local/share/gnome-shell/extensions/app-manager-remover@lokoyote.eu
 ```
 
 ---
@@ -152,7 +152,7 @@ GNOME Shell's `PopupMenu` is designed for simple menu items, not complex widget 
 ## File Structure
 
 ```
-app-manager@custom/
+app-manager-remover@lokoyote.eu/
 ├── metadata.json      # Extension metadata (name, UUID, GNOME versions)
 ├── extension.js       # Main extension logic (700 lines, fully commented)
 ├── stylesheet.css     # GNOME Shell CSS styles
