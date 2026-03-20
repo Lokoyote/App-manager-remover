@@ -1,4 +1,4 @@
-# App Manager — GNOME Shell Extension
+# App Manager Remover — GNOME Shell Extension
 
 A unified application manager for GNOME Shell that lists all user-installed applications — whether they come from **Flatpak**, **Snap**, or **Deb** packages — in a single, searchable floating panel with one-click uninstall.
 
@@ -118,8 +118,8 @@ The extension uses `apt remove` (not `apt purge`) so configuration files are pre
         │   clicks to close)  │
         └──────────┬──────────┘
                    │
-    ┌──────────────▼──────────────┐
-    │    AppManagerWindow         │
+    ┌──────────────▼─────────────┐
+    │    AppManagerWindow        │
     │  ┌────────────────────┐    │
     │  │ Header + Close btn │    │
     │  ├────────────────────┤    │
