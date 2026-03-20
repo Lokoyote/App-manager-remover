@@ -22,8 +22,7 @@ Built for GNOME Shell **45 / 46 / 47** (Ubuntu 23.10+, Fedora 39+, and other mod
 
 ## Screenshots
 
-> *Add screenshots of the floating panel, filter buttons, and confirmation dialog here.*
-
+![Texte alternatif](App-manager-remover.png "Extension Screeshot")
 ---
 
 ## Installation
