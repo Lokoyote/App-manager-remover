@@ -22,7 +22,7 @@ Built for GNOME Shell **45 / 46 / 47** (Ubuntu 23.10+, Fedora 39+, and other mod
 
 ## Screenshots
 
-!(App-manager-remover.png)
+![](App-manager-remover.png "App Screenshot")
 ---
 
 ## Installation
