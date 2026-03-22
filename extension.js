@@ -1,5 +1,5 @@
 /**
- * App Manager — GNOME Shell Extension
+ * App Manager Remover — GNOME Shell Extension
  *
  * A Windows-style application manager that displays all user-installed
  * applications regardless of packaging format (Flatpak, Snap, or Deb)
@@ -91,7 +91,7 @@ function runCommandArgv(argv) {
         proc.init(null);
         proc.wait_async(null, () => {});
     } catch (e) {
-        logError(e, 'app-manager: runCommandArgv');
+        logError(e, 'app-manager-remover: runCommandArgv');
     }
 }
 
@@ -343,113 +343,170 @@ function debPackageForDesktop(desktopFilePath) {
  * Collect all user-facing applications from the GNOME Shell app system,
  * applying the 6-layer filtering strategy to exclude system components.
  *
- * Key design decisions:
- *   - Each app is wrapped in its own try/catch so one broken .desktop
- *     entry never kills the entire list.
- *   - The NoDisplay check uses a 3-level fallback chain because the
- *     GDesktopAppInfo API varies across GJS/GNOME versions:
- *       1. get_nodisplay()  — GNOME 45+
- *       2. get_boolean('NoDisplay') — older GJS
- *       3. get_string('NoDisplay') — last resort
- *   - No dpkg queries are made during listing — they are deferred to
- *     uninstall-time to keep the panel responsive.
+ * This version includes extensive diagnostic logging to help debug
+ * empty-list issues on different GNOME Shell / GJS versions.
  *
- * @returns {Array<Object>} Sorted array of app objects:
- *   { name, iconName, source: 'flatpak'|'snap'|'deb',
- *     uninstallId, desktopId, desktopPath }
+ * @returns {Object} { apps: Array, debug: string }
  */
 function collectApps() {
-    let appSystem = Shell.AppSystem.get_default();
-    let allApps = appSystem.get_installed();
+    let debug = [];
+    let results = [];
 
-    // Pre-fetch package manager data (one call each, cached for this session)
-    let flatpakIds = getFlatpakIds();
-    let snapNames  = getSnapNames();
-    let results    = [];
+    // ── Step 1: Get the app system ──
+    let appSystem, allApps;
+    try {
+        appSystem = Shell.AppSystem.get_default();
+        debug.push(`[OK] Shell.AppSystem acquired`);
+    } catch (e) {
+        debug.push(`[FATAL] Shell.AppSystem.get_default() failed: ${e.message}`);
+        return { apps: [], debug: debug.join('\n') };
+    }
+
+    try {
+        allApps = appSystem.get_installed();
+        debug.push(`[OK] get_installed() returned ${allApps.length} entries`);
+    } catch (e) {
+        debug.push(`[FATAL] get_installed() failed: ${e.message}`);
+        return { apps: [], debug: debug.join('\n') };
+    }
+
+    if (!allApps || allApps.length === 0) {
+        debug.push(`[WARN] allApps is empty or null`);
+        return { apps: [], debug: debug.join('\n') };
+    }
+
+    // ── Step 2: Pre-fetch package manager data ──
+    let flatpakIds = new Set();
+    let snapNames = new Map();
+
+    try {
+        flatpakIds = getFlatpakIds();
+        debug.push(`[OK] Flatpak: ${flatpakIds.size} app IDs`);
+    } catch (e) {
+        debug.push(`[WARN] getFlatpakIds() failed: ${e.message}`);
+    }
+
+    try {
+        snapNames = getSnapNames();
+        debug.push(`[OK] Snap: ${snapNames.size} app names`);
+    } catch (e) {
+        debug.push(`[WARN] getSnapNames() failed: ${e.message}`);
+    }
+
+    // ── Step 3: Iterate apps with per-app diagnostics ──
+    let stats = {
+        total: allApps.length,
+        noId: 0,
+        noDisplay: 0,   // filtered by should_show() (NoDisplay, Hidden, OnlyShowIn, no Exec)
+        noName: 0,
+        filteredCategory: 0,
+        filteredPattern: 0,
+        accepted: 0,
+        errors: 0,
+    };
+
+    // Detect the API shape from the first entry to log which path we're on
+    if (allApps.length > 0) {
+        let first = allApps[0];
+        let hasGetAppInfo = typeof first.get_app_info === 'function';
+        let testAppInfo = null;
+        if (hasGetAppInfo) {
+            try { testAppInfo = first.get_app_info(); } catch (_e) { /* ignore */ }
+        }
+        if (testAppInfo) {
+            debug.push(`[OK] API: Shell.App path (get_app_info() works)`);
+        } else {
+            debug.push(`[OK] API: Direct DesktopAppInfo path (GNOME 46+)`);
+        }
+    }
 
     for (let i = 0; i < allApps.length; i++) {
         try {
-            let app = allApps[i];
-            let id = app.get_id();
-            if (!id) continue;
+            let entry = allApps[i];
 
-            let appInfo = app.get_app_info();
-            if (!appInfo) continue;
-
-            // ── Layer 1: Desktop entry metadata ──
-            //
-            // Reject entries marked as hidden, having no display name,
-            // or missing an icon (indicates a backend service, not a UI app).
-
-            // NoDisplay — 3-level fallback for GJS compatibility
-            let noDisplay = false;
-            try { noDisplay = appInfo.get_nodisplay(); } catch (_e1) {
-                try { noDisplay = appInfo.get_boolean('NoDisplay'); } catch (_e2) {
-                    try {
-                        let nd = appInfo.get_string('NoDisplay');
-                        noDisplay = (nd !== null && nd.toLowerCase() === 'true');
-                    } catch (_e3) { /* assume visible */ }
+            // GNOME 46+: get_installed() returns Gio.DesktopAppInfo directly.
+            // GNOME 45:  get_installed() returns Shell.App (with .get_app_info()).
+            // We handle both by checking if get_app_info() exists and works.
+            let appInfo;
+            try {
+                if (typeof entry.get_app_info === 'function') {
+                    appInfo = entry.get_app_info();
                 }
+            } catch (_e) { /* not a Shell.App, or method failed */ }
+
+            // If get_app_info() returned null or didn't exist,
+            // the entry itself IS the DesktopAppInfo (GNOME 46 path)
+            if (!appInfo) {
+                appInfo = entry;
             }
-            if (noDisplay) continue;
 
-            // Hidden check
-            let hidden = false;
-            try { hidden = appInfo.get_boolean('Hidden'); } catch (_e) {
-                try {
-                    let h = appInfo.get_string('Hidden');
-                    hidden = (h !== null && h.toLowerCase() === 'true');
-                } catch (_e2) { /* assume not hidden */ }
+            // ── Get the desktop ID ──
+            let id;
+            try { id = appInfo.get_id(); } catch (_e) { id = null; }
+            if (!id) { stats.noId++; continue; }
+
+            // ── Layer 1: should_show() ──
+            // This is THE method GNOME's own app grid (Super+A) uses.
+            // It checks NoDisplay, Hidden, OnlyShowIn/NotShowIn, and
+            // whether the app has a valid Exec line — all in one call.
+            // Apps like "Atunnel", "Foot Client", etc. are filtered here
+            // because they have OnlyShowIn!=GNOME or lack a proper Exec.
+            let shouldShow = true;
+            try {
+                if (typeof appInfo.should_show === 'function') {
+                    shouldShow = appInfo.should_show();
+                } else {
+                    // Fallback: manual NoDisplay check for older GJS
+                    if (typeof appInfo.get_nodisplay === 'function') {
+                        shouldShow = !appInfo.get_nodisplay();
+                    }
+                }
+            } catch (_e) { shouldShow = true; }
+            if (!shouldShow) { stats.noDisplay++; continue; }
+
+            // ── Require a display name ──
+            let name;
+            try { name = appInfo.get_name(); } catch (_e) { name = null; }
+            // Fallback: try get_display_name() or get_string('Name')
+            if (!name) {
+                try { name = appInfo.get_display_name(); } catch (_e) { /* pass */ }
             }
-            if (hidden) continue;
+            if (!name || name.length === 0) { stats.noName++; continue; }
 
-            // Require a display name and an icon
-            let name = app.get_name();
-            if (!name || name.length === 0) continue;
+            // ── Icon (optional — don't filter on it) ──
+            let iconName = 'application-x-executable';
+            try {
+                let icon = appInfo.get_icon();
+                if (icon) iconName = icon.to_string();
+            } catch (_e) { /* keep default icon */ }
 
-            let icon = null;
-            try { icon = appInfo.get_icon(); } catch (_e) { /* pass */ }
-            if (!icon) continue;
-
+            // ── Categories ──
             let categories = '';
             try { categories = appInfo.get_categories() || ''; } catch (_e) { /* pass */ }
 
             // ── Layer 2: XDG category analysis ──
-            if (hasOnlySystemCategories(categories)) continue;
+            if (hasOnlySystemCategories(categories)) { stats.filteredCategory++; continue; }
 
             // ── Layer 3: Desktop-ID pattern matching ──
-            if (matchesSystemPattern(id)) continue;
+            if (matchesSystemPattern(id)) { stats.filteredPattern++; continue; }
 
             // ── Determine packaging source ──
-
-            let iconName = 'application-x-executable';
-            try { iconName = icon.to_string(); } catch (_e) { /* keep fallback */ }
 
             let baseId = id.replace(/\.desktop$/, '');
             let source = 'deb';
             let uninstallId = baseId;
 
-            // Retrieve the .desktop file path for snap detection and
-            // deferred deb resolution at uninstall time
             let desktopPath = '';
             try { desktopPath = appInfo.get_filename() || ''; } catch (_e) { /* pass */ }
 
-            // ── Layer 4: Flatpak detection ──
-            // Match the desktop ID (minus .desktop) against flatpak --app list
+            // Layer 4: Flatpak
             if (flatpakIds.has(baseId)) {
                 source = 'flatpak';
                 uninstallId = baseId;
-
             } else {
-                // ── Layer 5: Snap detection ──
-                // Primary: check if the .desktop file lives under /snap/ or /snapd/
-                // Secondary: match by app name or desktop-ID against snap list
+                // Layer 5: Snap
                 let snapMatch = false;
-
                 if (desktopPath.includes('/snap/') || desktopPath.includes('/snapd/')) {
-                    // Extract snap name from the .desktop filename:
-                    // e.g. "/var/lib/snapd/desktop/applications/firefox_firefox.desktop"
-                    //       → basename "firefox_firefox.desktop" → candidate "firefox"
                     let baseName = GLib.path_get_basename(desktopPath);
                     let candidate = baseName.split('_')[0];
                     if (snapNames.has(candidate.toLowerCase())) {
@@ -458,8 +515,6 @@ function collectApps() {
                         snapMatch = true;
                     }
                 }
-
-                // Fallback: try matching by display name or base ID
                 if (!snapMatch) {
                     let nameLower = name.toLowerCase().replace(/\s+/g, '-');
                     if (snapNames.has(nameLower)) {
@@ -471,28 +526,37 @@ function collectApps() {
                     }
                 }
 
-                // ── Layer 6: Deb — deferred ──
-                // We intentionally do NOT call dpkg here to keep listing fast.
-                // The actual package name is resolved and protection-checked
-                // at uninstall time in _doUninstall().
+                // Layer 6: deferred to uninstall time
                 if (source === 'deb') {
                     uninstallId = baseId;
                 }
             }
 
             results.push({ name, iconName, source, uninstallId, desktopId: id, desktopPath });
+            stats.accepted++;
 
         } catch (e) {
-            // CRITICAL: one broken app must NEVER kill the entire list.
-            // Log the error for debugging, skip to the next entry.
-            log(`app-manager: skipping app #${i}: ${e.message}`);
-            continue;
+            stats.errors++;
+            log(`app-manager-remover: error on app #${i}: ${e.message}`);
         }
     }
 
+    // Build diagnostic summary
+    debug.push(`--- Filtering results ---`);
+    debug.push(`Total .desktop entries: ${stats.total}`);
+    debug.push(`No ID: ${stats.noId}`);
+    debug.push(`should_show()=false: ${stats.noDisplay}`);
+    debug.push(`No name: ${stats.noName}`);
+    debug.push(`Filtered by category: ${stats.filteredCategory}`);
+    debug.push(`Filtered by pattern: ${stats.filteredPattern}`);
+    debug.push(`Errors: ${stats.errors}`);
+    debug.push(`→ ACCEPTED: ${stats.accepted}`);
+
+    let debugStr = debug.join('\n');
+    log(`app-manager-remover:\n${debugStr}`);
+
     results.sort((a, b) => a.name.localeCompare(b.name));
-    log(`app-manager: found ${results.length} user apps out of ${allApps.length} total entries`);
-    return results;
+    return { apps: results, debug: debugStr };
 }
 
 
@@ -591,6 +655,7 @@ const AppManagerWindow = GObject.registerClass({
         });
 
         this._apps = [];           // Cached app list from collectApps()
+        this._debugInfo = '';       // Diagnostic output from last collectApps() run
         this._activeFilter = 'all'; // Current source filter ('all', 'deb', 'flatpak', 'snap')
         this._searchText = '';      // Current search query
 
@@ -720,10 +785,13 @@ const AppManagerWindow = GObject.registerClass({
         // Load apps on the next idle cycle to avoid blocking the Shell
         GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
             try {
-                this._apps = collectApps();
+                let result = collectApps();
+                this._apps = result.apps;
+                this._debugInfo = result.debug;
             } catch (e) {
-                logError(e, 'app-manager: collectApps');
+                logError(e, 'app-manager-remover: collectApps');
                 this._apps = [];
+                this._debugInfo = `[FATAL] collectApps() threw: ${e.message}\n${e.stack || ''}`;
             }
             this._populateList();
 
@@ -761,6 +829,17 @@ const AppManagerWindow = GObject.registerClass({
         }
 
         this._countLabel.text = `${count} application${count !== 1 ? 's' : ''}`;
+
+        // If no apps were found, show diagnostic info directly in the window
+        if (count === 0 && !search && this._activeFilter === 'all') {
+            let debugLabel = new St.Label({
+                text: this._debugInfo || 'No diagnostic info available.',
+                style: 'font-size: 11px; color: #ff9944; padding: 16px; font-family: monospace;',
+                x_expand: true,
+            });
+            debugLabel.clutter_text.set_line_wrap(true);
+            this._listBox.add_child(debugLabel);
+        }
     }
 
     /**
@@ -852,7 +931,7 @@ const AppManagerWindow = GObject.registerClass({
 
                 // Safety: double-check against dpkg before proceeding
                 if (isProtectedDebPackage(pkg)) {
-                    Main.notify('App Manager',
+                    Main.notify('App Manager Remover',
                         `${data.name} is a protected system package. Uninstall cancelled.`);
                     return;
                 }
@@ -865,7 +944,7 @@ const AppManagerWindow = GObject.registerClass({
             default: return;
         }
 
-        Main.notify('App Manager', `Uninstalling ${data.name}…`);
+        Main.notify('App Manager Remover', `Uninstalling ${data.name}…`);
         runCommandArgv(argv);
     }
 
@@ -922,7 +1001,7 @@ class Indicator extends PanelMenu.Button {
      * @param {Backdrop}         backdrop — The backdrop instance
      */
     _init(win, backdrop) {
-        super._init(0.0, 'App Manager', true);
+        super._init(0.0, 'App Manager Remover', true);
         this._win = win;
         this._bk = backdrop;
 
@@ -992,7 +1071,7 @@ export default class AppManagerExtension extends Extension {
 
         // Add the panel indicator (grid icon in the top bar)
         this._indicator = new Indicator(this._win, this._bk);
-        Main.panel.addToStatusArea('app-manager', this._indicator);
+        Main.panel.addToStatusArea('app-manager-remover', this._indicator);
     }
 
     disable() {
