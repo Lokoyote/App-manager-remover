@@ -1,120 +1,65 @@
-/**
- * App Manager Remover — GNOME Shell Extension
+/*
+ * App Manager Remover
+ * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * A Windows-style application manager that displays all user-installed
- * applications regardless of packaging format (Flatpak, Snap, or Deb)
- * in a unified floating panel, with one-click uninstall capability.
- *
- * Architecture:
- *   - A floating St.BoxLayout window attached to GNOME Shell's top chrome
- *     layer (avoids the limitations of PopupMenu for complex widget trees).
- *   - A transparent Backdrop widget catches outside clicks to dismiss.
- *   - A PanelMenu.Button indicator in the top bar toggles the window.
- *
- * App Discovery — 6-Layer Filtering Strategy:
- *   Layer 1: Desktop entry metadata (NoDisplay, Hidden, missing name/icon)
- *   Layer 2: XDG category analysis (reject entries with only system categories)
- *   Layer 3: Desktop-ID pattern matching (known system prefixes and infixes)
- *   Layer 4: Flatpak — only list applications, not runtimes or SDKs
- *   Layer 5: Snap — exclude base, core, snapd, and runtime snaps
- *   Layer 6: Deb — refuse to uninstall essential/required/system packages
- *
- * Safety:
- *   - Each app is processed inside its own try/catch — one broken entry
- *     never kills the entire list.
- *   - Expensive dpkg queries are deferred to uninstall-time, not listing-time.
- *   - Deb packages are double-checked against dpkg Priority/Essential/Section
- *     at the moment the user confirms removal.
- *   - Authentication is handled by pkexec (PolicyKit), which prompts the
- *     user's password through the system dialog.
- *
- * Compatibility: GNOME Shell 45 / 46 / 47 (ESM module format)
- *
- * @license GPL-3.0-or-later
+ * Lists user-installed apps (Flatpak, Snap, Deb) in a floating panel
+ * and lets you uninstall them with a single click.
  */
 
-// ─── GI Imports ──────────────────────────────────────────────────────────────
-
-import GLib    from 'gi://GLib';
-import Gio     from 'gi://Gio';
-import St      from 'gi://St';
+import GLib from 'gi://GLib';
+import Gio from 'gi://Gio';
+import St from 'gi://St';
 import Clutter from 'gi://Clutter';
 import GObject from 'gi://GObject';
-import Shell   from 'gi://Shell';
+import Shell from 'gi://Shell';
 
-// ─── GNOME Shell UI Imports ──────────────────────────────────────────────────
-
-import * as Main        from 'resource:///org/gnome/shell/ui/main.js';
-import * as PanelMenu   from 'resource:///org/gnome/shell/ui/panelMenu.js';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as ModalDialog from 'resource:///org/gnome/shell/ui/modalDialog.js';
-import { Extension }    from 'resource:///org/gnome/shell/extensions/extension.js';
+import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  SECTION 1 — Utility Functions
-// ═════════════════════════════════════════════════════════════════════════════
+// -- Helpers ----------------------------------------------------------------
 
-/**
- * Execute a shell command synchronously and return trimmed stdout.
- * Returns an empty string on failure (command not found, non-zero exit, etc.).
- * Used for querying package managers (flatpak list, snap list, dpkg-query).
- *
- * @param {string} cmdString — The full command string to execute
- * @returns {string} Trimmed stdout, or '' on error
- */
-function runCommand(cmdString) {
+function _spawn(cmdString) {
     try {
-        let [ok, stdout, stderr, exitStatus] = GLib.spawn_command_line_sync(cmdString);
-        if (ok && exitStatus === 0) {
+        const [ok, stdout, , status] = GLib.spawn_command_line_sync(cmdString);
+        if (ok && status === 0)
             return new TextDecoder().decode(stdout).trim();
-        }
-    } catch (_e) {
-        // Silently fail — the command may not exist on this system
-        // (e.g. flatpak not installed)
-    }
+    } catch (_) { /* binary may not be installed */ }
     return '';
 }
 
-/**
- * Execute a command asynchronously using Gio.Subprocess (fire-and-forget).
- * Used to launch uninstall commands (pkexec apt remove, flatpak uninstall, etc.)
- * without blocking the GNOME Shell main loop.
- *
- * @param {string[]} argv — Argument vector, e.g. ['pkexec', 'apt', 'remove', '-y', 'pkg']
- */
-function runCommandArgv(argv) {
+function _spawnAsync(argv) {
     try {
-        let proc = new Gio.Subprocess({
-            argv: argv,
-            flags: Gio.SubprocessFlags.NONE,
-        });
+        const proc = new Gio.Subprocess({argv, flags: Gio.SubprocessFlags.NONE});
         proc.init(null);
         proc.wait_async(null, () => {});
-    } catch (e) {
-        logError(e, 'app-manager-remover: runCommandArgv');
-    }
+    } catch (_) { /* ignore */ }
+}
+
+// GNOME 46+ returns Gio.DesktopAppInfo from get_installed();
+// GNOME 45 returns Shell.App (with .get_app_info()).
+function _toAppInfo(entry) {
+    try {
+        if (typeof entry.get_app_info === 'function') {
+            const info = entry.get_app_info();
+            if (info)
+                return info;
+        }
+    } catch (_) { /* not a Shell.App */ }
+    return entry;
 }
 
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  SECTION 2 — App Discovery (6-Layer Filtering)
-// ═════════════════════════════════════════════════════════════════════════════
+// -- Category filter --------------------------------------------------------
 
-// ─── Layer 2: XDG Category Analysis ─────────────────────────────────────────
-//
-// Strategy: an app is considered "system-only" if ALL its categories are in
-// the system set and NONE are in the user set. This lets apps like GIMP
-// (categories: "Graphics;System") pass through, while pure system entries
-// like "Settings" or "Core" are excluded.
-
-/** Categories that indicate a system/settings-only entry */
-const SYSTEM_ONLY_CATEGORIES = new Set([
+const _SYSTEM_CATS = new Set([
     'Settings', 'DesktopSettings', 'HardwareSettings',
     'PackageManager', 'Core', 'Monitor',
 ]);
 
-/** Categories that represent genuine user-facing activities */
-const USER_CATEGORIES = new Set([
+const _USER_CATS = new Set([
     'AudioVideo', 'Audio', 'Video', 'Development', 'Education',
     'Game', 'Graphics', 'Network', 'Office', 'Science', 'Utility',
     'Photography', 'Music', 'Player', 'Recorder', 'IDE', 'WebBrowser',
@@ -125,33 +70,17 @@ const USER_CATEGORIES = new Set([
     'Scanning', 'Archiving', 'Compression',
 ]);
 
-/**
- * Determine whether the app's categories indicate a system-only entry.
- * Returns true only if the app has at least one system category and
- * zero user-facing categories.
- *
- * @param {string} categoryString — Semicolon-separated XDG categories
- * @returns {boolean}
- */
-function hasOnlySystemCategories(categoryString) {
-    if (!categoryString) return false;
-    let cats = categoryString.split(';').map(c => c.trim()).filter(c => c);
-    if (cats.length === 0) return false;
-
-    let hasUser = cats.some(c => USER_CATEGORIES.has(c));
-    if (hasUser) return false;
-
-    return cats.some(c => SYSTEM_ONLY_CATEGORIES.has(c));
+function _onlySystemCats(raw) {
+    if (!raw) return false;
+    const cats = raw.split(';').filter(c => c);
+    if (cats.some(c => _USER_CATS.has(c))) return false;
+    return cats.some(c => _SYSTEM_CATS.has(c));
 }
 
-// ─── Layer 3: Desktop-ID Pattern Exclusion ──────────────────────────────────
-//
-// Known desktop-ID prefixes and infixes that belong to system plumbing,
-// GNOME core components, Ubuntu system tools, and input method utilities.
-// Matched case-insensitively against the full .desktop filename.
 
-/** Reject if the desktop-ID starts with any of these strings */
-const EXCLUDED_PREFIXES = [
+// -- Desktop-ID filter ------------------------------------------------------
+
+const _EX_PREFIXES = [
     'org.freedesktop.', 'org.gnome.settings', 'org.gnome.extensions',
     'org.gnome.terminal', 'org.gnome.console', 'org.gnome.nautilus',
     'org.gnome.systemmonitor', 'org.gnome.logs', 'org.gnome.diskutility',
@@ -164,8 +93,7 @@ const EXCLUDED_PREFIXES = [
     'xdg-', 'snap:',
 ];
 
-/** Reject if the desktop-ID contains any of these substrings */
-const EXCLUDED_INFIXES = [
+const _EX_INFIXES = [
     'nm-connection-editor', 'nm-applet', 'software-properties',
     'update-manager', 'update-notifier', 'gnome-language-selector',
     'gnome-session-properties', 'gnome-initial-setup', 'ibus-setup',
@@ -175,780 +103,393 @@ const EXCLUDED_INFIXES = [
     'gnome-system-log', 'systemd-', 'polkit-',
 ];
 
-/**
- * Check if a desktop-ID matches any known system pattern.
- *
- * @param {string} desktopId — Full desktop file ID (e.g. "org.gnome.Nautilus.desktop")
- * @returns {boolean}
- */
-function matchesSystemPattern(desktopId) {
-    let id = desktopId.toLowerCase();
-    for (let p of EXCLUDED_PREFIXES)
-        if (id.startsWith(p.toLowerCase())) return true;
-    for (let p of EXCLUDED_INFIXES)
-        if (id.includes(p.toLowerCase())) return true;
+function _isSystemId(desktopId) {
+    const lc = desktopId.toLowerCase();
+    for (const p of _EX_PREFIXES)
+        if (lc.startsWith(p)) return true;
+    for (const p of _EX_INFIXES)
+        if (lc.includes(p)) return true;
     return false;
 }
 
-// ─── Layer 4: Flatpak App Detection ─────────────────────────────────────────
 
-/**
- * Build a Set of installed Flatpak application IDs (reverse-DNS format).
- * The --app flag already excludes runtimes, SDKs, and extensions.
- * Returns an empty set if flatpak is not installed.
- *
- * @returns {Set<string>}
- */
-function getFlatpakIds() {
-    let set = new Set();
-    let out = runCommand('flatpak list --app --columns=application');
-    if (out) {
-        for (let line of out.split('\n')) {
-            let id = line.trim();
-            if (id) set.add(id);
-        }
-    }
-    return set;
+// -- Flatpak ----------------------------------------------------------------
+
+function _flatpakIds() {
+    const s = new Set();
+    const out = _spawn('flatpak list --app --columns=application');
+    if (out)
+        out.split('\n').forEach(l => { if (l.trim()) s.add(l.trim()); });
+    return s;
 }
 
-// ─── Layer 5: Snap App Detection ────────────────────────────────────────────
-//
-// Snap does not expose a "type" column in `snap list`, so we maintain a
-// known-list of system/runtime snap names plus regex patterns to filter
-// out infrastructure snaps (core, gnome platform, gtk themes, etc.).
 
-/** Well-known snap names that are system infrastructure, not user apps */
-const SNAP_SYSTEM_NAMES = new Set([
+// -- Snap -------------------------------------------------------------------
+
+const _SNAP_SYS = new Set([
     'bare', 'core', 'core18', 'core20', 'core22', 'core24',
     'gnome-3-28-1804', 'gnome-3-34-1804', 'gnome-3-38-2004',
     'gnome-42-2204', 'gnome-46-2404', 'gtk-common-themes',
     'snapd', 'snap-store', 'firmware-updater',
 ]);
-
-/** Regex patterns matching system snap naming conventions */
-const SNAP_SYSTEM_PATTERNS = [
-    /^core\d*$/,        // core, core20, core22, ...
-    /^gnome-\d/,        // gnome-42-2204, gnome-3-38-2004, ...
-    /^gtk-common/,      // gtk-common-themes
-    /^kde-frameworks/,  // KDE runtime snaps
-    /^snapd-desktop/,   // snapd desktop integration
-    /^mesa-/,           // Mesa GPU drivers
-    /^snapcraft$/,      // Build tool, not a user app
+const _SNAP_RE = [
+    /^core\d*$/, /^gnome-\d/, /^gtk-common/, /^kde-frameworks/,
+    /^snapd-desktop/, /^mesa-/, /^snapcraft$/,
 ];
 
-/**
- * Determine if a snap name belongs to system infrastructure.
- *
- * @param {string} name — Snap package name
- * @returns {boolean}
- */
-function isSystemSnap(name) {
-    let n = name.toLowerCase();
-    if (SNAP_SYSTEM_NAMES.has(n)) return true;
-    for (let re of SNAP_SYSTEM_PATTERNS)
-        if (re.test(n)) return true;
-    return false;
-}
-
-/**
- * Build a Map of installed snap names (lowercase → original case),
- * excluding system/runtime snaps.
- *
- * @returns {Map<string, string>}
- */
-function getSnapNames() {
-    let map = new Map();
-    let out = runCommand('snap list');
-    if (out) {
-        let lines = out.split('\n');
-        // Skip the header line ("Name  Version  Rev  ...")
-        for (let i = 1; i < lines.length; i++) {
-            let parts = lines[i].trim().split(/\s+/);
-            if (parts.length === 0 || !parts[0]) continue;
-            let name = parts[0];
-            if (isSystemSnap(name)) continue;
-            map.set(name.toLowerCase(), name);
-        }
+function _snapNames() {
+    const map = new Map();
+    const out = _spawn('snap list');
+    if (!out) return map;
+    for (const line of out.split('\n').slice(1)) {
+        const name = line.trim().split(/\s+/)[0];
+        if (!name) continue;
+        const lc = name.toLowerCase();
+        if (_SNAP_SYS.has(lc) || _SNAP_RE.some(r => r.test(lc))) continue;
+        map.set(lc, name);
     }
     return map;
 }
 
-// ─── Layer 6: Deb Package Protection ────────────────────────────────────────
-//
-// Ensures essential system packages can never be uninstalled through the UI.
-// This check is performed at uninstall-time (not listing-time) to avoid
-// expensive dpkg-query calls for every package on every panel open.
 
-/** dpkg sections that contain system internals, not user applications */
-const DEB_SYSTEM_SECTIONS = new Set([
+// -- Deb protection (checked at uninstall time only) ------------------------
+
+const _DEB_SYS_SECTIONS = new Set([
     'libs', 'oldlibs', 'libdevel', 'kernel', 'admin',
     'metapackages', 'tasks', 'debian-installer', 'base', 'shells',
 ]);
 
-/**
- * Query dpkg to determine if a package is a protected system component.
- * Checks three fields:
- *   - Essential: yes → always protected
- *   - Priority: required or important → protected
- *   - Section: libs, kernel, admin, etc. → protected
- *
- * @param {string} pkgName — Debian package name
- * @returns {boolean} True if the package should NOT be uninstalled
- */
-function isProtectedDebPackage(pkgName) {
-    if (!pkgName) return false;
-
-    let out = runCommand(
-        `dpkg-query -W -f='\${Priority}||||\${Essential}||||\${Section}' ${pkgName}`
-    );
+function _isProtectedDeb(pkg) {
+    if (!pkg) return false;
+    const out = _spawn(
+        `dpkg-query -W -f='\${Priority}||||\${Essential}||||\${Section}' ${pkg}`);
     if (!out) return false;
-
-    let parts = out.split('||||');
-    let priority  = (parts[0] || '').trim().toLowerCase();
-    let essential = (parts[1] || '').trim().toLowerCase();
-    let section   = (parts[2] || '').trim().toLowerCase();
-
-    // Strip component prefix (e.g. "universe/utils" → "utils")
-    if (section.includes('/')) section = section.split('/').pop();
-
-    if (essential === 'yes') return true;
-    if (priority === 'required' || priority === 'important') return true;
-    if (DEB_SYSTEM_SECTIONS.has(section)) return true;
-
-    return false;
+    const [pri, ess, rawSec] = out.split('||||').map(s => s.trim().toLowerCase());
+    const sec = rawSec?.includes('/') ? rawSec.split('/').pop() : rawSec;
+    if (ess === 'yes') return true;
+    if (pri === 'required' || pri === 'important') return true;
+    return _DEB_SYS_SECTIONS.has(sec);
 }
 
-/**
- * Resolve the Debian package name that owns a given .desktop file path.
- * Uses `dpkg -S <path>` which returns "package-name: /path/to/file".
- *
- * @param {string} desktopFilePath — Absolute path to the .desktop file
- * @returns {string|null} Package name, or null if unresolvable
- */
-function debPackageForDesktop(desktopFilePath) {
-    if (!desktopFilePath) return null;
-
-    let out = runCommand(`dpkg -S "${desktopFilePath}"`);
-    if (out) {
-        let match = out.split(':')[0];
-        if (match && !match.includes(' ')) return match.trim();
-    }
-    return null;
+function _debPkgForDesktop(path) {
+    if (!path) return null;
+    const out = _spawn(`dpkg -S "${path}"`);
+    if (!out) return null;
+    const pkg = out.split(':')[0];
+    return (pkg && !pkg.includes(' ')) ? pkg.trim() : null;
 }
 
 
-// ─── Master Collection Function ─────────────────────────────────────────────
+// -- App collection ---------------------------------------------------------
 
-/**
- * Collect all user-facing applications from the GNOME Shell app system,
- * applying the 6-layer filtering strategy to exclude system components.
- *
- * This version includes extensive diagnostic logging to help debug
- * empty-list issues on different GNOME Shell / GJS versions.
- *
- * @returns {Object} { apps: Array, debug: string }
- */
-function collectApps() {
-    let debug = [];
-    let results = [];
+function _collectApps() {
+    const all = Shell.AppSystem.get_default().get_installed();
+    if (!all?.length) return [];
 
-    // ── Step 1: Get the app system ──
-    let appSystem, allApps;
-    try {
-        appSystem = Shell.AppSystem.get_default();
-        debug.push(`[OK] Shell.AppSystem acquired`);
-    } catch (e) {
-        debug.push(`[FATAL] Shell.AppSystem.get_default() failed: ${e.message}`);
-        return { apps: [], debug: debug.join('\n') };
-    }
+    const fpIds = _flatpakIds();
+    const snaps = _snapNames();
+    const results = [];
 
-    try {
-        allApps = appSystem.get_installed();
-        debug.push(`[OK] get_installed() returned ${allApps.length} entries`);
-    } catch (e) {
-        debug.push(`[FATAL] get_installed() failed: ${e.message}`);
-        return { apps: [], debug: debug.join('\n') };
-    }
-
-    if (!allApps || allApps.length === 0) {
-        debug.push(`[WARN] allApps is empty or null`);
-        return { apps: [], debug: debug.join('\n') };
-    }
-
-    // ── Step 2: Pre-fetch package manager data ──
-    let flatpakIds = new Set();
-    let snapNames = new Map();
-
-    try {
-        flatpakIds = getFlatpakIds();
-        debug.push(`[OK] Flatpak: ${flatpakIds.size} app IDs`);
-    } catch (e) {
-        debug.push(`[WARN] getFlatpakIds() failed: ${e.message}`);
-    }
-
-    try {
-        snapNames = getSnapNames();
-        debug.push(`[OK] Snap: ${snapNames.size} app names`);
-    } catch (e) {
-        debug.push(`[WARN] getSnapNames() failed: ${e.message}`);
-    }
-
-    // ── Step 3: Iterate apps with per-app diagnostics ──
-    let stats = {
-        total: allApps.length,
-        noId: 0,
-        noDisplay: 0,   // filtered by should_show() (NoDisplay, Hidden, OnlyShowIn, no Exec)
-        noName: 0,
-        filteredCategory: 0,
-        filteredPattern: 0,
-        accepted: 0,
-        errors: 0,
-    };
-
-    // Detect the API shape from the first entry to log which path we're on
-    if (allApps.length > 0) {
-        let first = allApps[0];
-        let hasGetAppInfo = typeof first.get_app_info === 'function';
-        let testAppInfo = null;
-        if (hasGetAppInfo) {
-            try { testAppInfo = first.get_app_info(); } catch (_e) { /* ignore */ }
-        }
-        if (testAppInfo) {
-            debug.push(`[OK] API: Shell.App path (get_app_info() works)`);
-        } else {
-            debug.push(`[OK] API: Direct DesktopAppInfo path (GNOME 46+)`);
-        }
-    }
-
-    for (let i = 0; i < allApps.length; i++) {
+    for (let i = 0; i < all.length; i++) {
         try {
-            let entry = allApps[i];
+            const info = _toAppInfo(all[i]);
 
-            // GNOME 46+: get_installed() returns Gio.DesktopAppInfo directly.
-            // GNOME 45:  get_installed() returns Shell.App (with .get_app_info()).
-            // We handle both by checking if get_app_info() exists and works.
-            let appInfo;
+            const id = info.get_id?.() ?? null;
+            if (!id) continue;
+
+            // should_show() is the same check GNOME's launcher uses:
+            // NoDisplay, Hidden, OnlyShowIn, valid Exec...
             try {
-                if (typeof entry.get_app_info === 'function') {
-                    appInfo = entry.get_app_info();
-                }
-            } catch (_e) { /* not a Shell.App, or method failed */ }
+                if (typeof info.should_show === 'function' && !info.should_show())
+                    continue;
+                else if (typeof info.get_nodisplay === 'function' && info.get_nodisplay())
+                    continue;
+            } catch (_) { /* assume visible */ }
 
-            // If get_app_info() returned null or didn't exist,
-            // the entry itself IS the DesktopAppInfo (GNOME 46 path)
-            if (!appInfo) {
-                appInfo = entry;
-            }
+            const name = info.get_name?.() || info.get_display_name?.() || null;
+            if (!name) continue;
 
-            // ── Get the desktop ID ──
-            let id;
-            try { id = appInfo.get_id(); } catch (_e) { id = null; }
-            if (!id) { stats.noId++; continue; }
+            let categories = '';
+            try { categories = info.get_categories() || ''; } catch (_) { /**/ }
+            if (_onlySystemCats(categories)) continue;
+            if (_isSystemId(id)) continue;
 
-            // ── Layer 1: should_show() ──
-            // This is THE method GNOME's own app grid (Super+A) uses.
-            // It checks NoDisplay, Hidden, OnlyShowIn/NotShowIn, and
-            // whether the app has a valid Exec line — all in one call.
-            // Apps like "Atunnel", "Foot Client", etc. are filtered here
-            // because they have OnlyShowIn!=GNOME or lack a proper Exec.
-            let shouldShow = true;
-            try {
-                if (typeof appInfo.should_show === 'function') {
-                    shouldShow = appInfo.should_show();
-                } else {
-                    // Fallback: manual NoDisplay check for older GJS
-                    if (typeof appInfo.get_nodisplay === 'function') {
-                        shouldShow = !appInfo.get_nodisplay();
-                    }
-                }
-            } catch (_e) { shouldShow = true; }
-            if (!shouldShow) { stats.noDisplay++; continue; }
-
-            // ── Require a display name ──
-            let name;
-            try { name = appInfo.get_name(); } catch (_e) { name = null; }
-            // Fallback: try get_display_name() or get_string('Name')
-            if (!name) {
-                try { name = appInfo.get_display_name(); } catch (_e) { /* pass */ }
-            }
-            if (!name || name.length === 0) { stats.noName++; continue; }
-
-            // ── Icon (optional — don't filter on it) ──
             let iconName = 'application-x-executable';
             try {
-                let icon = appInfo.get_icon();
-                if (icon) iconName = icon.to_string();
-            } catch (_e) { /* keep default icon */ }
+                const ic = info.get_icon();
+                if (ic) iconName = ic.to_string();
+            } catch (_) { /**/ }
 
-            // ── Categories ──
-            let categories = '';
-            try { categories = appInfo.get_categories() || ''; } catch (_e) { /* pass */ }
-
-            // ── Layer 2: XDG category analysis ──
-            if (hasOnlySystemCategories(categories)) { stats.filteredCategory++; continue; }
-
-            // ── Layer 3: Desktop-ID pattern matching ──
-            if (matchesSystemPattern(id)) { stats.filteredPattern++; continue; }
-
-            // ── Determine packaging source ──
-
-            let baseId = id.replace(/\.desktop$/, '');
-            let source = 'deb';
-            let uninstallId = baseId;
-
+            const baseId = id.replace(/\.desktop$/, '');
+            let source = 'deb', uninstallId = baseId;
             let desktopPath = '';
-            try { desktopPath = appInfo.get_filename() || ''; } catch (_e) { /* pass */ }
+            try { desktopPath = info.get_filename() || ''; } catch (_) { /**/ }
 
-            // Layer 4: Flatpak
-            if (flatpakIds.has(baseId)) {
+            if (fpIds.has(baseId)) {
                 source = 'flatpak';
                 uninstallId = baseId;
             } else {
-                // Layer 5: Snap
-                let snapMatch = false;
+                let matched = false;
                 if (desktopPath.includes('/snap/') || desktopPath.includes('/snapd/')) {
-                    let baseName = GLib.path_get_basename(desktopPath);
-                    let candidate = baseName.split('_')[0];
-                    if (snapNames.has(candidate.toLowerCase())) {
+                    const cand = GLib.path_get_basename(desktopPath).split('_')[0];
+                    if (snaps.has(cand.toLowerCase())) {
                         source = 'snap';
-                        uninstallId = snapNames.get(candidate.toLowerCase());
-                        snapMatch = true;
+                        uninstallId = snaps.get(cand.toLowerCase());
+                        matched = true;
                     }
                 }
-                if (!snapMatch) {
-                    let nameLower = name.toLowerCase().replace(/\s+/g, '-');
-                    if (snapNames.has(nameLower)) {
+                if (!matched) {
+                    const nameLc = name.toLowerCase().replace(/\s+/g, '-');
+                    if (snaps.has(nameLc)) {
                         source = 'snap';
-                        uninstallId = snapNames.get(nameLower);
-                    } else if (snapNames.has(baseId.toLowerCase())) {
+                        uninstallId = snaps.get(nameLc);
+                    } else if (snaps.has(baseId.toLowerCase())) {
                         source = 'snap';
-                        uninstallId = snapNames.get(baseId.toLowerCase());
+                        uninstallId = snaps.get(baseId.toLowerCase());
                     }
-                }
-
-                // Layer 6: deferred to uninstall time
-                if (source === 'deb') {
-                    uninstallId = baseId;
                 }
             }
 
-            results.push({ name, iconName, source, uninstallId, desktopId: id, desktopPath });
-            stats.accepted++;
-
-        } catch (e) {
-            stats.errors++;
-            log(`app-manager-remover: error on app #${i}: ${e.message}`);
+            results.push({name, iconName, source, uninstallId, desktopId: id, desktopPath});
+        } catch (_) {
+            continue;
         }
     }
 
-    // Build diagnostic summary
-    debug.push(`--- Filtering results ---`);
-    debug.push(`Total .desktop entries: ${stats.total}`);
-    debug.push(`No ID: ${stats.noId}`);
-    debug.push(`should_show()=false: ${stats.noDisplay}`);
-    debug.push(`No name: ${stats.noName}`);
-    debug.push(`Filtered by category: ${stats.filteredCategory}`);
-    debug.push(`Filtered by pattern: ${stats.filteredPattern}`);
-    debug.push(`Errors: ${stats.errors}`);
-    debug.push(`→ ACCEPTED: ${stats.accepted}`);
-
-    let debugStr = debug.join('\n');
-    log(`app-manager-remover:\n${debugStr}`);
-
-    results.sort((a, b) => a.name.localeCompare(b.name));
-    return { apps: results, debug: debugStr };
+    return results.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  SECTION 3 — Confirmation Dialog
-// ═════════════════════════════════════════════════════════════════════════════
+// -- Confirm dialog ---------------------------------------------------------
 
-/**
- * Modal dialog that asks the user to confirm an uninstall action.
- * Displays the app name, packaging source, and package identifier.
- * Calls onConfirm() only when the user explicitly clicks "Uninstall".
- */
 const ConfirmDialog = GObject.registerClass(
 class ConfirmDialog extends ModalDialog.ModalDialog {
+    _init(appName, source, pkgId, onConfirm) {
+        super._init({styleClass: 'app-manager-confirm-dialog'});
 
-    /**
-     * @param {string} appName     — Human-readable application name
-     * @param {string} source      — Packaging source ('flatpak', 'snap', 'deb')
-     * @param {string} uninstallId — Package identifier used for removal
-     * @param {Function} onConfirm — Callback executed on confirmation
-     */
-    _init(appName, source, uninstallId, onConfirm) {
-        super._init({ styleClass: 'app-manager-confirm-dialog' });
-
-        let content = new St.BoxLayout({
+        const box = new St.BoxLayout({
             vertical: true,
-            style: 'spacing: 12px; padding: 20px; min-width: 300px;',
+            style: 'spacing:12px; padding:20px; min-width:300px;',
         });
-        this.contentLayout.add_child(content);
+        this.contentLayout.add_child(box);
 
-        // Title
-        content.add_child(new St.Label({
+        box.add_child(new St.Label({
             text: `Uninstall "${appName}"?`,
-            style: 'font-size: 16px; font-weight: bold; text-align: center;',
+            style: 'font-size:16px; font-weight:bold; text-align:center;',
             x_align: Clutter.ActorAlign.CENTER,
         }));
-
-        // Details
-        content.add_child(new St.Label({
-            text: [
-                `Source: ${source.toUpperCase()}`,
-                `Package: ${uninstallId}`,
-                '',
-                'Your password will be required to proceed.',
-            ].join('\n'),
-            style: 'font-size: 13px; text-align: center; color: #aaa;',
+        box.add_child(new St.Label({
+            text: `Source: ${source.toUpperCase()}\nPackage: ${pkgId}\n\nYour password will be required.`,
+            style: 'font-size:13px; text-align:center; color:#aaa;',
             x_align: Clutter.ActorAlign.CENTER,
         }));
 
         this.setButtons([
-            {
-                label: 'Cancel',
-                action: () => this.close(),
-                key: Clutter.KEY_Escape,
-            },
-            {
-                label: 'Uninstall',
-                action: () => { this.close(); onConfirm(); },
-                default: true,
-            },
+            {label: 'Cancel', action: () => this.close(), key: Clutter.KEY_Escape},
+            {label: 'Uninstall', action: () => { this.close(); onConfirm(); }, default: true},
         ]);
     }
 });
 
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  SECTION 4 — Floating Application Window
-// ═════════════════════════════════════════════════════════════════════════════
-//
-// We use a floating St.BoxLayout attached to GNOME Shell's top chrome layer
-// instead of a PopupMenu. This approach was chosen because PopupMenu cannot
-// reliably render complex widget trees (ScrollView with dynamic children),
-// which causes the panel to appear empty when using the menu-based approach.
+// -- Application window -----------------------------------------------------
 
-/**
- * The main floating window that displays the application list.
- *
- * Lifecycle:
- *   open()  — positions the window, triggers async app collection,
- *             populates the scrollable list, and focuses the search bar.
- *   close() — hides the window and emits the 'closed' signal so the
- *             backdrop can hide itself.
- *
- * Emits: 'closed' — when the window is dismissed.
- */
-const AppManagerWindow = GObject.registerClass({
-    Signals: { 'closed': {} },
-}, class AppManagerWindow extends St.BoxLayout {
+const AppWindow = GObject.registerClass({
+    Signals: {'closed': {}},
+}, class AppWindow extends St.BoxLayout {
 
     _init() {
         super._init({
-            vertical: true,
-            visible: false,
-            reactive: true,
+            vertical: true, visible: false, reactive: true,
             style_class: 'app-manager-window',
         });
-
-        this._apps = [];           // Cached app list from collectApps()
-        this._debugInfo = '';       // Diagnostic output from last collectApps() run
-        this._activeFilter = 'all'; // Current source filter ('all', 'deb', 'flatpak', 'snap')
-        this._searchText = '';      // Current search query
-
+        this._apps = [];
+        this._filter = 'all';
+        this._search = '';
+        this._idleId = 0;
         this._buildUI();
     }
 
-    /**
-     * Construct the full widget tree: header, search bar, filter buttons,
-     * count label, and scrollable app list container.
-     */
     _buildUI() {
-        // ── Header bar with title and close button ──
-        let header = new St.BoxLayout({ style_class: 'app-manager-header' });
+        const header = new St.BoxLayout({style_class: 'app-manager-header'});
         this.add_child(header);
-
         header.add_child(new St.Icon({
-            icon_name: 'view-grid-symbolic',
-            icon_size: 22,
-            style: 'margin-right: 10px;',
+            icon_name: 'view-grid-symbolic', icon_size: 22,
+            style: 'margin-right:10px;',
         }));
-
         header.add_child(new St.Label({
-            text: 'Applications',
-            style_class: 'app-manager-title',
-            y_align: Clutter.ActorAlign.CENTER,
-            x_expand: true,
+            text: 'Applications', style_class: 'app-manager-title',
+            y_align: Clutter.ActorAlign.CENTER, x_expand: true,
         }));
-
-        let closeBtn = new St.Button({
+        const close = new St.Button({
             style_class: 'app-manager-close-btn',
-            child: new St.Icon({ icon_name: 'window-close-symbolic', icon_size: 16 }),
+            child: new St.Icon({icon_name: 'window-close-symbolic', icon_size: 16}),
         });
-        closeBtn.connect('clicked', () => this.close());
-        header.add_child(closeBtn);
+        close.connect('clicked', () => this.close());
+        header.add_child(close);
 
-        // ── Search entry ──
-        this._searchEntry = new St.Entry({
+        this._entry = new St.Entry({
             hint_text: '  Search applications…',
-            style_class: 'app-manager-search',
-            can_focus: true,
+            style_class: 'app-manager-search', can_focus: true,
         });
-        this._searchEntry.get_clutter_text().connect('text-changed', () => {
-            this._searchText = this._searchEntry.get_text();
-            this._populateList();
+        this._entry.get_clutter_text().connect('text-changed', () => {
+            this._search = this._entry.get_text();
+            this._fill();
         });
-        this.add_child(this._searchEntry);
+        this.add_child(this._entry);
 
-        // ── Source filter buttons ──
-        let filterBar = new St.BoxLayout({ style_class: 'app-manager-filters' });
-        this.add_child(filterBar);
-
-        this._filterBtns = {};
-        for (let { key, label } of [
-            { key: 'all',     label: 'All' },
-            { key: 'deb',     label: 'Deb' },
-            { key: 'flatpak', label: 'Flatpak' },
-            { key: 'snap',    label: 'Snap' },
+        const bar = new St.BoxLayout({style_class: 'app-manager-filters'});
+        this.add_child(bar);
+        this._btns = {};
+        for (const {key, label} of [
+            {key: 'all', label: 'All'}, {key: 'deb', label: 'Deb'},
+            {key: 'flatpak', label: 'Flatpak'}, {key: 'snap', label: 'Snap'},
         ]) {
-            let btn = new St.Button({
-                label,
-                style_class: 'app-manager-filter-btn',
-                toggle_mode: true,
+            const b = new St.Button({
+                label, style_class: 'app-manager-filter-btn', toggle_mode: true,
             });
-            if (key === 'all') btn.checked = true;
-
-            btn.connect('clicked', () => {
-                this._activeFilter = key;
-                // Update toggle states
-                for (let [k, b] of Object.entries(this._filterBtns))
-                    b.checked = (k === key);
-                this._populateList();
+            if (key === 'all') b.checked = true;
+            b.connect('clicked', () => {
+                this._filter = key;
+                Object.entries(this._btns).forEach(([k, v]) => { v.checked = k === key; });
+                this._fill();
             });
-
-            filterBar.add_child(btn);
-            this._filterBtns[key] = btn;
+            bar.add_child(b);
+            this._btns[key] = b;
         }
 
-        // ── App count label ──
-        this._countLabel = new St.Label({
-            text: 'Loading…',
-            style_class: 'app-manager-count',
-        });
-        this.add_child(this._countLabel);
+        this._count = new St.Label({text: '', style_class: 'app-manager-count'});
+        this.add_child(this._count);
 
-        // ── Scrollable application list ──
-        this._scrollView = new St.ScrollView({
+        const scroll = new St.ScrollView({
             style_class: 'app-manager-scroll',
-            overlay_scrollbars: true,
-            x_expand: true,
-            y_expand: true,
+            overlay_scrollbars: true, x_expand: true, y_expand: true,
         });
-        this.add_child(this._scrollView);
-
-        this._listBox = new St.BoxLayout({
-            vertical: true,
-            style_class: 'app-manager-list',
-            x_expand: true,
+        this.add_child(scroll);
+        this._list = new St.BoxLayout({
+            vertical: true, style_class: 'app-manager-list', x_expand: true,
         });
-        this._scrollView.set_child(this._listBox);
+        scroll.set_child(this._list);
     }
 
-    /**
-     * Open the floating window: position it below the top panel,
-     * reset filters, and kick off asynchronous app loading.
-     */
     open() {
         this.show();
-        this._searchEntry.set_text('');
-        this._activeFilter = 'all';
-        for (let [k, b] of Object.entries(this._filterBtns))
-            b.checked = (k === 'all');
+        this._entry.set_text('');
+        this._filter = 'all';
+        Object.entries(this._btns).forEach(([k, b]) => { b.checked = k === 'all'; });
+        this._count.text = 'Loading…';
+        this._list.destroy_all_children();
 
-        this._countLabel.text = 'Loading…';
-        this._listBox.destroy_all_children();
+        const mon = Main.layoutManager.primaryMonitor;
+        const pH = Main.panel.get_height();
+        const w = 460, h = Math.min(mon.height - pH - 40, 700);
+        this.set_size(w, h);
+        this.set_position(mon.x + mon.width - w - 12, mon.y + pH + 6);
 
-        // Position: anchored to the top-right, just below the panel
-        let monitor = Main.layoutManager.primaryMonitor;
-        let panelH = Main.panel.get_height();
-        let winW = 460;
-        let winH = Math.min(monitor.height - panelH - 40, 700);
-        this.set_size(winW, winH);
-        this.set_position(
-            monitor.x + monitor.width - winW - 12,
-            monitor.y + panelH + 6
-        );
-
-        // Load apps on the next idle cycle to avoid blocking the Shell
-        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-            try {
-                let result = collectApps();
-                this._apps = result.apps;
-                this._debugInfo = result.debug;
-            } catch (e) {
-                logError(e, 'app-manager-remover: collectApps');
-                this._apps = [];
-                this._debugInfo = `[FATAL] collectApps() threw: ${e.message}\n${e.stack || ''}`;
-            }
-            this._populateList();
-
-            // Auto-focus the search bar for immediate typing
-            global.stage.set_key_focus(this._searchEntry);
+        this._idleId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            this._apps = _collectApps();
+            this._fill();
+            global.stage.set_key_focus(this._entry);
+            this._idleId = 0;
             return GLib.SOURCE_REMOVE;
         });
     }
 
-    /** Hide the window and notify the backdrop. */
     close() {
+        this._removeIdle();
         this.hide();
         this.emit('closed');
     }
 
-    /**
-     * Rebuild the visible app list based on current filter and search text.
-     * Called whenever the user types in the search bar or clicks a filter.
-     */
-    _populateList() {
-        this._listBox.destroy_all_children();
-        let search = this._searchText.toLowerCase();
-        let count = 0;
-
-        for (let app of this._apps) {
-            // Apply source filter
-            if (this._activeFilter !== 'all' && app.source !== this._activeFilter)
-                continue;
-            // Apply search filter
-            if (search && !app.name.toLowerCase().includes(search))
-                continue;
-
-            this._listBox.add_child(this._makeRow(app));
-            count++;
-        }
-
-        this._countLabel.text = `${count} application${count !== 1 ? 's' : ''}`;
-
-        // If no apps were found, show diagnostic info directly in the window
-        if (count === 0 && !search && this._activeFilter === 'all') {
-            let debugLabel = new St.Label({
-                text: this._debugInfo || 'No diagnostic info available.',
-                style: 'font-size: 11px; color: #ff9944; padding: 16px; font-family: monospace;',
-                x_expand: true,
-            });
-            debugLabel.clutter_text.set_line_wrap(true);
-            this._listBox.add_child(debugLabel);
+    _removeIdle() {
+        if (this._idleId) {
+            GLib.Source.remove(this._idleId);
+            this._idleId = 0;
         }
     }
 
-    /**
-     * Create a single app row widget: icon + name/badge + uninstall button.
-     *
-     * @param {Object} data — App data object from collectApps()
-     * @returns {St.BoxLayout}
-     */
-    _makeRow(data) {
-        let row = new St.BoxLayout({
-            style_class: 'app-manager-row',
-            reactive: true,
-            track_hover: true,
-            x_expand: true,
-        });
+    _fill() {
+        this._list.destroy_all_children();
+        const q = this._search.toLowerCase();
+        let n = 0;
+        for (const app of this._apps) {
+            if (this._filter !== 'all' && app.source !== this._filter) continue;
+            if (q && !app.name.toLowerCase().includes(q)) continue;
+            this._list.add_child(this._row(app));
+            n++;
+        }
+        this._count.text = `${n} application${n !== 1 ? 's' : ''}`;
+    }
 
-        // App icon (32px, with generic fallback)
+    _row(d) {
+        const row = new St.BoxLayout({
+            style_class: 'app-manager-row',
+            reactive: true, track_hover: true, x_expand: true,
+        });
         row.add_child(new St.Icon({
-            icon_name: data.iconName,
-            icon_size: 32,
+            icon_name: d.iconName, icon_size: 32,
             style_class: 'app-manager-icon',
             fallback_icon_name: 'application-x-executable',
         }));
 
-        // Name and source badge
-        let info = new St.BoxLayout({ vertical: true, x_expand: true, style: 'spacing: 3px;' });
-        info.add_child(new St.Label({
-            text: data.name,
-            style_class: 'app-manager-app-name',
+        const col = new St.BoxLayout({vertical: true, x_expand: true, style: 'spacing:3px;'});
+        col.add_child(new St.Label({
+            text: d.name, style_class: 'app-manager-app-name',
             x_align: Clutter.ActorAlign.START,
         }));
-        info.add_child(new St.Label({
-            text: data.source.toUpperCase(),
-            style_class: `app-manager-badge app-manager-badge-${data.source}`,
+        col.add_child(new St.Label({
+            text: d.source.toUpperCase(),
+            style_class: `app-manager-badge app-manager-badge-${d.source}`,
             x_align: Clutter.ActorAlign.START,
         }));
-        row.add_child(info);
+        row.add_child(col);
 
-        // Uninstall button (trash icon)
-        let btn = new St.Button({
+        const btn = new St.Button({
             style_class: 'app-manager-uninstall-btn',
-            child: new St.Icon({ icon_name: 'user-trash-symbolic', icon_size: 16 }),
+            child: new St.Icon({icon_name: 'user-trash-symbolic', icon_size: 16}),
             y_align: Clutter.ActorAlign.CENTER,
         });
         btn.connect('clicked', () => {
             this.close();
-            let dlg = new ConfirmDialog(data.name, data.source, data.uninstallId, () => {
-                this._doUninstall(data);
-            });
-            dlg.open(global.get_current_time());
+            new ConfirmDialog(d.name, d.source, d.uninstallId, () => {
+                this._uninstall(d);
+            }).open(global.get_current_time());
         });
         row.add_child(btn);
-
         return row;
     }
 
-    /**
-     * Execute the appropriate uninstall command for the given app.
-     *
-     * - Flatpak: `flatpak uninstall -y <app-id>` (no sudo needed)
-     * - Snap:    `pkexec snap remove <snap-name>` (prompts for password)
-     * - Deb:     `pkexec apt remove -y <package>` (prompts for password)
-     *
-     * For deb packages, the actual package name is resolved at this point
-     * (deferred from listing-time) and a protection check is performed.
-     *
-     * @param {Object} data — App data object from collectApps()
-     */
-    _doUninstall(data) {
+    _uninstall(d) {
         let argv;
-
-        switch (data.source) {
-            case 'flatpak':
-                argv = ['flatpak', 'uninstall', '--noninteractive', '-y', data.uninstallId];
-                break;
-
-            case 'snap':
-                argv = ['pkexec', 'snap', 'remove', data.uninstallId];
-                break;
-
-            case 'deb': {
-                // Resolve the real deb package name from the .desktop path
-                // (deferred from collectApps for performance)
-                let pkg = data.uninstallId;
-                if (data.desktopPath) {
-                    let resolved = debPackageForDesktop(data.desktopPath);
-                    if (resolved) pkg = resolved;
-                }
-
-                // Safety: double-check against dpkg before proceeding
-                if (isProtectedDebPackage(pkg)) {
-                    Main.notify('App Manager Remover',
-                        `${data.name} is a protected system package. Uninstall cancelled.`);
-                    return;
-                }
-
-                // Use apt remove (NOT purge) to preserve config files
-                argv = ['pkexec', 'apt', 'remove', '-y', pkg];
-                break;
+        switch (d.source) {
+        case 'flatpak':
+            argv = ['flatpak', 'uninstall', '--noninteractive', '-y', d.uninstallId];
+            break;
+        case 'snap':
+            // pkexec is required per EGO guidelines for privileged subprocesses
+            argv = ['pkexec', 'snap', 'remove', d.uninstallId];
+            break;
+        case 'deb': {
+            let pkg = d.uninstallId;
+            if (d.desktopPath) {
+                const resolved = _debPkgForDesktop(d.desktopPath);
+                if (resolved) pkg = resolved;
             }
-
-            default: return;
+            if (_isProtectedDeb(pkg)) {
+                Main.notify('App Manager Remover',
+                    `${d.name} is a protected system package.`);
+                return;
+            }
+            // pkexec is required per EGO guidelines for privileged subprocesses
+            argv = ['pkexec', 'apt', 'remove', '-y', pkg];
+            break;
         }
-
-        Main.notify('App Manager Remover', `Uninstalling ${data.name}…`);
-        runCommandArgv(argv);
+        default: return;
+        }
+        Main.notify('App Manager Remover', `Uninstalling ${d.name}…`);
+        _spawnAsync(argv);
     }
 
-    /** Allow pressing Escape to dismiss the window. */
     vfunc_key_press_event(event) {
         if (event.get_key_symbol() === Clutter.KEY_Escape) {
             this.close();
@@ -959,22 +500,14 @@ const AppManagerWindow = GObject.registerClass({
 });
 
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  SECTION 5 — Backdrop (Dismiss-on-outside-click)
-// ═════════════════════════════════════════════════════════════════════════════
+// -- Backdrop ---------------------------------------------------------------
 
-/**
- * A transparent full-screen widget placed behind the floating window.
- * Catches any click outside the window and closes it, mimicking the
- * behavior of a dropdown or popover dismissal.
- */
 const Backdrop = GObject.registerClass(
 class Backdrop extends St.Widget {
     _init(win) {
-        super._init({ reactive: true, visible: false });
+        super._init({reactive: true, visible: false});
         this._win = win;
     }
-
     vfunc_button_press_event() {
         this._win.close();
         return Clutter.EVENT_STOP;
@@ -982,41 +515,19 @@ class Backdrop extends St.Widget {
 });
 
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  SECTION 6 — Panel Indicator (Top Bar Button)
-// ═════════════════════════════════════════════════════════════════════════════
+// -- Panel button -----------------------------------------------------------
 
-/**
- * The panel button (grid icon) in GNOME Shell's top bar.
- * Clicking it toggles the floating application window.
- *
- * Initialized with `dontCreateMenu = true` (third argument) because we
- * manage our own floating window instead of using PanelMenu's built-in menu.
- */
 const Indicator = GObject.registerClass(
 class Indicator extends PanelMenu.Button {
-
-    /**
-     * @param {AppManagerWindow} win      — The floating window instance
-     * @param {Backdrop}         backdrop — The backdrop instance
-     */
-    _init(win, backdrop) {
+    _init(win, bk) {
         super._init(0.0, 'App Manager Remover', true);
         this._win = win;
-        this._bk = backdrop;
-
+        this._bk = bk;
         this.add_child(new St.Icon({
-            icon_name: 'view-grid-symbolic',
-            style_class: 'system-status-icon',
+            icon_name: 'view-grid-symbolic', style_class: 'system-status-icon',
         }));
     }
 
-    /**
-     * Intercept click and touch events to toggle the window.
-     * We override vfunc_event instead of connecting to 'button-press-event'
-     * because PanelMenu.Button with dontCreateMenu=true does not relay
-     * standard signal handlers.
-     */
     vfunc_event(event) {
         if (event.type() === Clutter.EventType.BUTTON_PRESS ||
             event.type() === Clutter.EventType.TOUCH_BEGIN) {
@@ -1026,16 +537,13 @@ class Indicator extends PanelMenu.Button {
         return Clutter.EVENT_PROPAGATE;
     }
 
-    /** Show or hide the floating window and its backdrop. */
     _toggle() {
         if (this._win.visible) {
             this._win.close();
         } else {
-            // Size and position the backdrop to cover the screen
-            // (starting below the panel so the panel remains clickable)
-            let mon = Main.layoutManager.primaryMonitor;
-            this._bk.set_position(mon.x, mon.y + Main.panel.get_height());
-            this._bk.set_size(mon.width, mon.height);
+            const m = Main.layoutManager.primaryMonitor;
+            this._bk.set_position(m.x, m.y + Main.panel.get_height());
+            this._bk.set_size(m.width, m.height);
             this._bk.show();
             this._win.open();
         }
@@ -1043,39 +551,35 @@ class Indicator extends PanelMenu.Button {
 });
 
 
-// ═════════════════════════════════════════════════════════════════════════════
-//  SECTION 7 — Extension Lifecycle
-// ═════════════════════════════════════════════════════════════════════════════
+// -- Extension lifecycle ----------------------------------------------------
 
-/**
- * Main extension class. Manages the lifecycle of all components:
- *   enable()  — creates the window, backdrop, and indicator
- *   disable() — destroys everything cleanly (required by GNOME review policy)
- *
- * All widgets are added to Main.layoutManager.addTopChrome() so they
- * overlay above normal windows and receive input correctly.
- */
-export default class AppManagerExtension extends Extension {
+export default class AppManagerRemoverExtension extends Extension {
 
     enable() {
-        // Create the floating window and its backdrop
-        this._win = new AppManagerWindow();
-        this._bk  = new Backdrop(this._win);
+        this._win = new AppWindow();
+        this._bk = new Backdrop(this._win);
 
-        // When the window closes, also dismiss the backdrop
-        this._win.connect('closed', () => this._bk.hide());
+        this._closedId = this._win.connect('closed', () => this._bk.hide());
 
-        // Add both to the top chrome layer (above all windows)
         Main.layoutManager.addTopChrome(this._bk);
         Main.layoutManager.addTopChrome(this._win);
 
-        // Add the panel indicator (grid icon in the top bar)
         this._indicator = new Indicator(this._win, this._bk);
         Main.panel.addToStatusArea('app-manager-remover', this._indicator);
     }
 
     disable() {
-        // Clean up in reverse order (required for GNOME Shell extension review)
+        if (this._closedId) {
+            this._win.disconnect(this._closedId);
+            this._closedId = 0;
+        }
+
+        this._win._removeIdle();
+
+        if (this._indicator) {
+            this._indicator.destroy();
+            this._indicator = null;
+        }
         if (this._win) {
             Main.layoutManager.removeChrome(this._win);
             this._win.destroy();
@@ -1085,10 +589,6 @@ export default class AppManagerExtension extends Extension {
             Main.layoutManager.removeChrome(this._bk);
             this._bk.destroy();
             this._bk = null;
-        }
-        if (this._indicator) {
-            this._indicator.destroy();
-            this._indicator = null;
         }
     }
 }
