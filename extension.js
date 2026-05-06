@@ -1,1024 +1,642 @@
-/**
- * Unity Buttons — GNOME Shell Extension
+/*
+ * App Manager Remover
+ * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * Adds macOS-style window control buttons (close + restore) to the top
- * panel when a window is maximized, alongside the window title. Maximized
- * windows have their WM titlebar hidden to save vertical space. On
- * unmaximize, windows are centered at a user-configured size percentage.
- *
- * All maximize/unmaximize animations are 100% GNOME Shell native.
- * The extension never manipulates actor opacity during transitions.
- * A synchronous "poison" technique overwrites Mutter's internal
- * saved_rect so subsequent cycles animate to the correct target.
- *
- * Wayland only. GNOME Shell 46 & 47.
- * XWayland apps (Spotify, etc.) get titlebar hiding via _MOTIF_WM_HINTS.
- * License: GPL-3.0-or-later
+ * Lists user-installed apps (Flatpak, Snap, Deb) in a floating panel
+ * and lets you uninstall them with a single click.
  */
 
-import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
-import * as Main      from 'resource:///org/gnome/shell/ui/main.js';
-import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
-import St      from 'gi://St';
+import GLib from 'gi://GLib';
+import Gio from 'gi://Gio';
+import St from 'gi://St';
 import Clutter from 'gi://Clutter';
 import GObject from 'gi://GObject';
-import Gio     from 'gi://Gio';
-import Meta    from 'gi://Meta';
-import GLib    from 'gi://GLib';
+import Shell from 'gi://Shell';
 
-/* Promisify async file IO once for the lifetime of the module.
- * Required to satisfy EGO-X-004: avoid synchronous file IO in shell code. */
-Gio._promisify(Gio.File.prototype, 'load_contents_async', 'load_contents_finish');
-Gio._promisify(Gio.File.prototype, 'replace_contents_async', 'replace_contents_finish');
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
+import * as ModalDialog from 'resource:///org/gnome/shell/ui/modalDialog.js';
+import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
-/* ─── Constants ─────────────────────────────────────────────────────── */
 
-/** Desktop-manager windows that must never be tracked. */
-const DESKTOP_WM = new Set([
-    'ding', 'nemo-desktop', 'nautilus-desktop', 'caja-desktop',
-]);
+// -- Async subprocess helpers ----------------------------------------------
 
 /**
- * GTK3 CSS injected into ~/.config/gtk-3.0/gtk.css to hide the
- * client-side titlebar of LibreOffice when maximized. Uses the specific
- * class signature of LO's CSD window to avoid false positives.
+ * Run a subprocess and return its trimmed stdout as a Promise<string>.
+ * Returns '' on any error (binary missing, non-zero exit, cancellation, ...).
+ *
+ * @param {string[]} argv - Command + arguments (no shell interpretation).
+ * @param {Gio.Cancellable|null} [cancellable]
+ * @returns {Promise<string>}
  */
-const LO_HACK = `
-/* Targets the headerbar inside LibreOffice's maximized CSD window */
-window.maximized.background.csd.tiled-top.tiled-bottom.tiled-right.tiled-left > grid > headerbar.titlebar.default-decoration,
-window.maximized.background.csd.tiled-top.tiled-bottom.tiled-right.tiled-left > headerbar.titlebar.default-decoration {
-    min-height: 0px;
-    min-width: 0px;
-    margin: 0;
-    padding: 0px;
-    margin: 0px;
-    border: none;
-    font-size: 0px;
-    opacity: 0;
-    background: none;
-    box-shadow: none;
-    outline: none;
-    margin-top: -30px;
-}`;
+function _spawnAsync(argv, cancellable = null) {
+    return new Promise(resolve => {
+        let proc;
+        try {
+            proc = Gio.Subprocess.new(
+                argv,
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE
+            );
+        } catch (_) {
+            // Binary not found, etc.
+            resolve('');
+            return;
+        }
 
-/** Panel button colors (Ubuntu-style). */
-const BTN = {
-    close:   { n: '#df4a16', h: '#e95420' },
-    restore: { n: '#5f5e5a', h: '#7a7974' },
-};
-const STYLE_BASE = 'border-radius:16px;margin:0 3px;'
-                 + 'border:1px solid rgba(0,0,0,.2);transition-duration:150ms;';
-const btnStyle = (c) =>
-    `background-color:${c};width:16px;height:16px;${STYLE_BASE}`;
-
-/** Global safety timeout (ms) — last-resort cleanup. */
-const ANIM_SAFETY_MS = 800;
-/** Delay (ms) for xprop subprocess to process decoration changes (XWayland). */
-const DECOR_WAIT_MS  = 150;
-/** Position tolerance (px) for rect comparisons. */
-const TOLERANCE      = 5;
-
-/* ─── Helpers ───────────────────────────────────────────────────────── */
+        proc.communicate_utf8_async(null, cancellable, (p, res) => {
+            try {
+                const [, stdout] = p.communicate_utf8_finish(res);
+                resolve(p.get_successful() ? (stdout || '').trim() : '');
+            } catch (_) {
+                resolve('');
+            }
+        });
+    });
+}
 
 /**
- * Returns true if the window is X11 (XWayland under a Wayland session).
- * Apps like Spotify Flatpak run via XWayland and can have their decorations
- * controlled via _MOTIF_WM_HINTS, unlike native Wayland windows.
+ * Fire-and-forget subprocess (used for uninstall commands that can take
+ * arbitrarily long and whose output we don't need).
+ *
+ * @param {string[]} argv
  */
-const _isX11 = (w) => w?.get_client_type() === Meta.WindowClientType.X11;
-
-/**
- * Detects Client-Side Decorations by comparing buffer_rect to frame_rect.
- * CSD apps draw their own shadows, making buffer > frame by several px.
- * Only reliable when the window is NOT maximized. Used for XWayland apps.
- */
-const _hasCSD = (win) => {
+function _spawnDetached(argv) {
     try {
-        const fr = win.get_frame_rect(), br = win.get_buffer_rect?.();
-        if (!fr || !br) return false;
-        return (Math.abs(br.width - fr.width) > 4 || Math.abs(br.height - fr.height) > 4);
-    } catch (_) { return false; }
-};
+        const proc = Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE);
+        proc.wait_async(null, () => {});
+    } catch (_) { /* ignore */ }
+}
 
-/** Runs fn inside try/catch, returns result or undefined on error. */
-const _safe = (fn) => { try { return fn(); } catch (_) { return undefined; } };
-
-/** Returns true if two rect objects match within TOLERANCE. */
-const rectsMatch = (a, b) =>
-    Math.abs(a.width  - b.width)  <= TOLERANCE &&
-    Math.abs(a.height - b.height) <= TOLERANCE &&
-    Math.abs(a.x      - b.x)     <= TOLERANCE &&
-    Math.abs(a.y      - b.y)     <= TOLERANCE;
-
-/** Snapshots a Meta.Rectangle into a plain JS object. */
-const snapRect = (r) => ({ x: r.x, y: r.y, width: r.width, height: r.height });
-
-/**
- * Per-window state store (WeakMap, auto-GC'd when window is destroyed).
- * All fields are initialized with safe defaults.
- */
-const _ws = new WeakMap();
-const ws  = (w) => {
-    if (!_ws.has(w)) _ws.set(w, {
-        tracked: false, wasMax: false, sigs: [],
-        animating: false,
-        mapTimeoutId: 0, mapCleanup: null, mapHandled: false,
-        debounceId: 0, nudgeCleanup: null,
-        preMaxRect: null, nativeUnmax: false, overridePending: false,
-        poisoning: false, isCSD: false, wmClass: '',
-    });
-    return _ws.get(w);
-};
-
-/** Connects to a GObject signal once; returns a cleanup function. */
-function onceSignal(obj, sig, cb, filter) {
-    let id = obj.connect(sig, () => {
-        if (filter && !filter()) return;
-        if (id) { obj.disconnect(id); id = 0; }
-        cb();
-    });
-    return () => { if (id) { obj.disconnect(id); id = 0; } };
+// GNOME 46+ returns Gio.DesktopAppInfo from get_installed();
+// GNOME 45 returns Shell.App (with .get_app_info()).
+function _toAppInfo(entry) {
+    try {
+        if (typeof entry.get_app_info === 'function') {
+            const info = entry.get_app_info();
+            if (info)
+                return info;
+        }
+    } catch (_) { /* not a Shell.App */ }
+    return entry;
 }
 
 
-/* ═══════════════════════════════════════════════════════════════════════
-   PANEL INDICATOR
-   ═══════════════════════════════════════════════════════════════════════ */
+// -- Category filter --------------------------------------------------------
 
-/**
- * The panel widget that displays close/restore buttons and the window
- * title. Visible only when a NORMAL window is maximized and focused.
- */
-const UnityButtons = GObject.registerClass(
-class UnityButtons extends PanelMenu.Button {
+const _SYSTEM_CATS = new Set([
+    'Settings', 'DesktopSettings', 'HardwareSettings',
+    'PackageManager', 'Core', 'Monitor',
+]);
 
-    _init(settings, ext) {
-        super._init(0.0, 'UnityButtons');
-        this._s = settings;
-        this._ext = ext;
-        this.style_class = 'unity-panel-button';
-        this.menu.setSensitive(false);
-        this.menu.actor.hide();
+const _USER_CATS = new Set([
+    'AudioVideo', 'Audio', 'Video', 'Development', 'Education',
+    'Game', 'Graphics', 'Network', 'Office', 'Science', 'Utility',
+    'Photography', 'Music', 'Player', 'Recorder', 'IDE', 'WebBrowser',
+    'Email', 'Chat', 'InstantMessaging', 'Finance', 'Calendar',
+    'ContactManagement', 'Database', 'Spreadsheet', 'WordProcessor',
+    'Publishing', 'Presentation', 'Viewer', 'TextEditor',
+    'RasterGraphics', 'VectorGraphics', '3DGraphics',
+    'Scanning', 'Archiving', 'Compression',
+]);
 
-        this._box = new St.BoxLayout({
-            style_class: 'unity-container',
-            y_align: Clutter.ActorAlign.CENTER,
-        });
-        const bb = new St.BoxLayout({
-            style_class: 'unity-buttons-box',
-            y_align: Clutter.ActorAlign.CENTER,
-        });
-        bb.add_child(this._mkBtn('close'));
-        bb.add_child(this._mkBtn('restore'));
-        this._title = new St.Label({
-            style_class: 'unity-title',
-            y_align: Clutter.ActorAlign.CENTER,
-        });
-        this._box.add_child(bb);
-        this._box.add_child(this._title);
-        this.add_child(this._box);
+function _onlySystemCats(raw) {
+    if (!raw) return false;
+    const cats = raw.split(';').filter(c => c);
+    if (cats.some(c => _USER_CATS.has(c))) return false;
+    return cats.some(c => _SYSTEM_CATS.has(c));
+}
 
-        this._sigs     = [];
-        this._safeties = new Set();
-        this._sources  = new Set();   // tracks all GLib.idle_add ids (EGO-L-004)
-        this._titleWin = null;
-        this._titleSig = 0;
-        this._connectGlobal();
+
+// -- Desktop-ID filter ------------------------------------------------------
+
+const _EX_PREFIXES = [
+    'org.freedesktop.', 'org.gnome.settings', 'org.gnome.extensions',
+    'org.gnome.terminal', 'org.gnome.console', 'org.gnome.nautilus',
+    'org.gnome.systemmonitor', 'org.gnome.logs', 'org.gnome.diskutility',
+    'org.gnome.disks', 'org.gnome.font', 'org.gnome.characters',
+    'org.gnome.baobab', 'org.gnome.powerstats', 'org.gnome.firmware',
+    'org.gnome.tweaks', 'org.gnome.connections', 'org.gnome.clocks',
+    'org.gnome.weather', 'org.gnome.maps', 'org.gnome.contacts',
+    'org.gnome.calendar', 'org.gnome.snapshot', 'org.gnome.portal',
+    'org.gnome.shell.', 'org.gnome.evolution-data', 'org.gtk.',
+    'xdg-', 'snap:',
+];
+
+const _EX_INFIXES = [
+    'nm-connection-editor', 'nm-applet', 'software-properties',
+    'update-manager', 'update-notifier', 'gnome-language-selector',
+    'gnome-session-properties', 'gnome-initial-setup', 'ibus-setup',
+    'im-config', 'fcitx-config', 'input-remapper', 'yelp',
+    'info.desktop', 'debian-uxterm', 'debian-xterm', 'display-im6',
+    'hwe-support-status', 'apport-gtk', 'ubuntu-report',
+    'gnome-system-log', 'systemd-', 'polkit-',
+];
+
+function _isSystemId(desktopId) {
+    const lc = desktopId.toLowerCase();
+    for (const p of _EX_PREFIXES)
+        if (lc.startsWith(p)) return true;
+    for (const p of _EX_INFIXES)
+        if (lc.includes(p)) return true;
+    return false;
+}
+
+
+// -- Flatpak ----------------------------------------------------------------
+
+async function _flatpakIds(cancellable) {
+    const s = new Set();
+    const out = await _spawnAsync(
+        ['flatpak', 'list', '--app', '--columns=application'],
+        cancellable);
+    if (out)
+        out.split('\n').forEach(l => { if (l.trim()) s.add(l.trim()); });
+    return s;
+}
+
+
+// -- Snap -------------------------------------------------------------------
+
+const _SNAP_SYS = new Set([
+    'bare', 'core', 'core18', 'core20', 'core22', 'core24',
+    'gnome-3-28-1804', 'gnome-3-34-1804', 'gnome-3-38-2004',
+    'gnome-42-2204', 'gnome-46-2404', 'gtk-common-themes',
+    'snapd', 'snap-store', 'firmware-updater',
+]);
+const _SNAP_RE = [
+    /^core\d*$/, /^gnome-\d/, /^gtk-common/, /^kde-frameworks/,
+    /^snapd-desktop/, /^mesa-/, /^snapcraft$/,
+];
+
+async function _snapNames(cancellable) {
+    const map = new Map();
+    const out = await _spawnAsync(['snap', 'list'], cancellable);
+    if (!out) return map;
+    for (const line of out.split('\n').slice(1)) {
+        const name = line.trim().split(/\s+/)[0];
+        if (!name) continue;
+        const lc = name.toLowerCase();
+        if (_SNAP_SYS.has(lc) || _SNAP_RE.some(r => r.test(lc))) continue;
+        map.set(lc, name);
     }
+    return map;
+}
 
-    vfunc_event() { return Clutter.EVENT_PROPAGATE; }
 
-    /** Creates a close or restore button with hover styling. */
-    _mkBtn(type) {
-        const c = BTN[type];
-        const sN = btnStyle(c.n), sH = btnStyle(c.h);
-        const btn = new St.Button({
-            style: sN, reactive: true, track_hover: true,
-            y_align: Clutter.ActorAlign.CENTER,
-        });
-        btn.connect('notify::hover', (b) => { b.style = b.hover ? sH : sN; });
-        btn.connect('clicked', () => {
-            const w = global.display.get_focus_window();
-            if (!w) return;
-            if (type === 'close')
-                w.delete(global.get_current_time());
-            else if (w.get_maximized() === Meta.MaximizeFlags.BOTH)
-                w.unmaximize(Meta.MaximizeFlags.BOTH);
-        });
-        return btn;
-    }
+// -- Deb protection (checked at uninstall time only) ------------------------
 
-    /** Registers a signal connection for batch cleanup in destroy(). */
-    _sig(obj, signal, fn) {
-        this._sigs.push([obj, obj.connect(signal, fn)]);
-    }
+const _DEB_SYS_SECTIONS = new Set([
+    'libs', 'oldlibs', 'libdevel', 'kernel', 'admin',
+    'metapackages', 'tasks', 'debian-installer', 'base', 'shells',
+]);
 
-    /** Registers a safety timeout that auto-removes from the set on fire. */
-    _safety(ms, fn) {
-        const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
-            this._safeties.delete(id);
-            fn(); return GLib.SOURCE_REMOVE;
-        });
-        this._safeties.add(id);
-    }
+async function _isProtectedDeb(pkg) {
+    if (!pkg) return false;
+    const out = await _spawnAsync([
+        'dpkg-query', '-W',
+        '-f=${Priority}||||${Essential}||||${Section}',
+        pkg,
+    ]);
+    if (!out) return false;
+    const [pri, ess, rawSec] = out.split('||||').map(s => s.trim().toLowerCase());
+    const sec = rawSec?.includes('/') ? rawSec.split('/').pop() : rawSec;
+    if (ess === 'yes') return true;
+    if (pri === 'required' || pri === 'important') return true;
+    return _DEB_SYS_SECTIONS.has(sec);
+}
 
-    /** Registers a GLib.idle_add and tracks the id for cleanup in destroy(). */
-    _idle(priority, fn) {
-        let id = 0;
-        id = GLib.idle_add(priority, () => {
-            const r = fn();
-            if (r === GLib.SOURCE_REMOVE && id) {
-                this._sources.delete(id);
-                id = 0;
-            }
-            return r;
-        });
-        this._sources.add(id);
-        return id;
-    }
+async function _debPkgForDesktop(path) {
+    if (!path) return null;
+    // Pass `path` as a separate argv element — no shell interpolation.
+    const out = await _spawnAsync(['dpkg', '-S', path]);
+    if (!out) return null;
+    const pkg = out.split(':')[0];
+    return (pkg && !pkg.includes(' ')) ? pkg.trim() : null;
+}
 
-    /* ── Global signals ──────────────────────────────────────────────── */
 
-    _connectGlobal() {
-        this._sig(global.display, 'notify::focus-window', () => this._refresh());
-        this._sig(global.display, 'window-created', (_d, w) =>
-            this._idle(GLib.PRIORITY_DEFAULT_IDLE, () => {
-                this._track(w); return GLib.SOURCE_REMOVE;
-            }));
-        this._sig(global.workspace_manager, 'active-workspace-changed',
-            () => this._refresh());
-        this._sig(Main.overview, 'showing', () => {
-            this.visible = false; this._ext.updateLayout(false);
-        });
-        this._sig(Main.overview, 'hidden', () => this._refresh());
-        this._sig(global.window_manager, 'map', (_wm, a) => this._onMap(a));
-        this._sig(global.window_manager, 'size-change',
-            (_wm, a, whichChange, oldFrame, _newFrame) =>
-                this._onSizeChange(a, whichChange, oldFrame));
-        for (const a of global.get_window_actors()) this._track(a.meta_window);
-    }
+// -- App collection ---------------------------------------------------------
 
-    /* ── Per-window tracking ─────────────────────────────────────────── */
+async function _collectApps(cancellable) {
+    const all = Shell.AppSystem.get_default().get_installed();
+    if (!all?.length) return [];
 
-    /**
-     * Starts tracking a window: connects maximization signals and
-     * caches wmClass for desktop-manager exclusion.
-     */
-    _track(win) {
-        if (!win) return;
-        const s = ws(win);
-        if (s.tracked) return;
-        if (win.get_window_type() !== Meta.WindowType.NORMAL) return;
-        s.wmClass = (win.get_wm_class() || '').toLowerCase();
-        if (DESKTOP_WM.has(s.wmClass)) return;
+    // Run the two listing commands concurrently — they're independent,
+    // so the total wall-clock time is max(flatpak, snap) instead of sum.
+    const [fpIds, snaps] = await Promise.all([
+        _flatpakIds(cancellable),
+        _snapNames(cancellable),
+    ]);
 
-        s.tracked = true;
-        s.wasMax  = win.get_maximized() === Meta.MaximizeFlags.BOTH;
+    const results = [];
 
-        /* XWayland: CSD detection + apply xprop if already maximized */
-        if (_isX11(win)) {
-            s.isCSD = s.wasMax ? false : _hasCSD(win);
-            if (s.wasMax) this._ext.applyXprop(win, true);
-        }
-
-        const add = (sig, fn) => s.sigs.push(win.connect(sig, fn));
-        add('notify::maximized-horizontally', () => this._onMaxChanged(win));
-        add('notify::maximized-vertically',   () => this._onMaxChanged(win));
-
-        /* Track last known non-maximized rect for nativeUnmax optimization. */
-        const updatePreMaxRect = () => {
-            if (win.get_maximized() || s.animating) return;
-            _safe(() => {
-                const fr = win.get_frame_rect();
-                if (fr.width > 10 && fr.height > 10)
-                    s.preMaxRect = snapRect(fr);
-            });
-        };
-        add('size-changed',     updatePreMaxRect);
-        add('position-changed', updatePreMaxRect);
-    }
-
-    /** Disconnects all signals and cleans up timers for a tracked window. */
-    _untrack(win) {
-        const s = ws(win);
-        if (!s.tracked) return;
-        for (const id of s.sigs)
-            _safe(() => win.disconnect(id));
-        if (s.debounceId)   { GLib.source_remove(s.debounceId);   s.debounceId = 0; }
-        if (s.mapTimeoutId) { GLib.source_remove(s.mapTimeoutId); s.mapTimeoutId = 0; }
-        this._ext._cancelAnim(win);
-        if (s.mapCleanup)   { s.mapCleanup();   s.mapCleanup   = null; }
-        if (s.nudgeCleanup) { s.nudgeCleanup(); s.nudgeCleanup = null; }
-        _ws.delete(win);
-    }
-
-    /* ══════════════════════════════════════════════════════════════════
-       SIZE-CHANGE INTERCEPTION
-       ══════════════════════════════════════════════════════════════════ */
-
-    /**
-     * Synchronous handler for size-change (fires before Mutter moves the actor).
-     *
-     * MAX: saves pre-maximize rect, lets GNOME animate natively.
-     * UNMAX nativeUnmax (preMaxRect ≈ targetRect): lets GNOME animate natively.
-     * UNMAX override (preMaxRect ≠ targetRect): sets overridePending flag.
-     *   A HIGH-priority idle will execute before the next paint frame.
-     */
-    _onSizeChange(actor, whichChange, oldFrame) {
-        const isMax   = whichChange === Meta.SizeChange.MAXIMIZE;
-        const isUnmax = whichChange === Meta.SizeChange.UNMAXIMIZE;
-        if (!isMax && !isUnmax) return;
-
-        const win = actor?.meta_window;
-        if (!win) return;
-        const s = ws(win);
-        if (!s.tracked || s.poisoning) return;
-
-        /* XWayland: VLC excluded from decoration manipulation */
-        if (_isX11(win) && s.wmClass.includes('vlc')) return;
-
-        if (isMax && oldFrame)
-            s.preMaxRect = snapRect(oldFrame);
-        if (isMax) return;
-
-        const tgt = this._ext._targetRect(win);
-        if (s.preMaxRect && tgt && rectsMatch(s.preMaxRect, tgt)) {
-            s.nativeUnmax = true;
-            /* XWayland: updateLayout is instant (safe during animation).
-             * xprop(restore) is deferred to _processMaxChange after animation. */
-            if (_isX11(win))
-                this._ext.updateLayout(false);
-            return;
-        }
-
-        s.nativeUnmax = false;
-        s.overridePending = true;
-    }
-
-    /* ── Maximize state change dispatch ──────────────────────────────── */
-
-    /**
-     * Debounced handler for notify::maximized-* signals.
-     * Routes to _doUnmaxOverride (HIGH priority) for overrides,
-     * or _processMaxChange (DEFAULT_IDLE) for normal MAX/nativeUnmax.
-     */
-    _onMaxChanged(win) {
-        const s = ws(win);
-        if (s.debounceId || s.poisoning) return;
-
-        if (s.overridePending) {
-            s.overridePending = false;
-            s.debounceId = GLib.idle_add(GLib.PRIORITY_HIGH, () => {
-                s.debounceId = 0;
-                this._doUnmaxOverride(win);
-                return GLib.SOURCE_REMOVE;
-            });
-            return;
-        }
-
-        s.debounceId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-            s.debounceId = 0;
-            this._processMaxChange(win);
-            return GLib.SOURCE_REMOVE;
-        });
-    }
-
-    /**
-     * UNMAX override — runs at PRIORITY_HIGH before the next Clutter paint.
-     *
-     * GNOME has configured its animation toward saved_rect (wrong target)
-     * but has NOT rendered any frame yet. This handler:
-     *   1. Kills GNOME's animation and finalizes Mutter geometry
-     *   2. Places the window at targetRect (no frame rendered yet)
-     *   3. Restores button layout
-     *   4. Ensures actor is visible and clean
-     *   5. Defers a poison cycle so the NEXT MAX→UNMAX is native
-     */
-    _doUnmaxOverride(win) {
-        if (!win) return;
-        const s = ws(win);
-        if (!s.tracked) return;
-
-        const tgt = this._ext._targetRect(win);
-        const actor = win.get_compositor_private?.();
-        if (!tgt || !actor) {
-            this._ext._cancelAnim(win);
-            this._refresh();
-            return;
-        }
-
-        /* 1. Kill GNOME's animation + finalize Mutter geometry */
-        actor.remove_all_transitions();
-        _safe(() => global.window_manager.completed_size_change(actor));
-        _safe(() => Main.wm._resizing?.delete(actor));
-        _safe(() => Main.wm._resizePending?.delete(actor));
-
-        /* 2. Place window at target */
-        _safe(() => win.move_resize_frame(true,
-            tgt.x, tgt.y, tgt.width, tgt.height));
-
-        /* 3. Restore button layout + XWayland CSD detection */
-        if (_isX11(win)) {
-            const csdNow = _hasCSD(win);
-            if (csdNow !== s.isCSD) s.isCSD = csdNow;
-        }
-        this._ext.updateLayout(false);
-
-        /* 4. Ensure actor is clean and visible */
-        actor.set_scale(1, 1);
-        actor.set_pivot_point(0, 0);
-        actor.translation_x = 0;
-        actor.translation_y = 0;
-        actor.show();
-        actor.opacity = 255;
-
-        /* 5. Update internal state */
-        s.wasMax = false;
-        s.nativeUnmax = false;
-        s.preMaxRect = snapRect(tgt);
-        s.animating = false;
-
-        this._refresh();
-        this._activate(win);
-
-        /* 6. Deferred: restore decorations + poison for native next cycle. */
-        const poisonDelay = _isX11(win) ? DECOR_WAIT_MS : 100;
-        this._ext._defer(poisonDelay, () => {
-            if (!win || win.get_maximized()) return;
-
-            /* XWayland: restore decorations (deferred to avoid mid-paint pop). */
-            if (_isX11(win))
-                this._ext.applyXprop(win, false);
-
-            const fr = _safe(() => win.get_frame_rect());
-            if (fr && !rectsMatch(fr, tgt))
-                _safe(() => win.move_resize_frame(true,
-                    tgt.x, tgt.y, tgt.width, tgt.height));
-
-            this._ext._poisonSavedRect(win, s, tgt);
-
-            if (_isX11(win)) {
-                /* XWayland CSD: micro-resize to refresh shadows */
-                if (s.isCSD && !win.get_maximized()) {
-                    _safe(() => {
-                        const r = win.get_frame_rect();
-                        win.move_resize_frame(true, r.x, r.y, r.width - 1, r.height);
-                    });
-                    this._idle(GLib.PRIORITY_DEFAULT_IDLE, () => {
-                        if (!win || win.get_maximized()) return GLib.SOURCE_REMOVE;
-                        _safe(() => {
-                            const r = win.get_frame_rect();
-                            win.move_resize_frame(true, r.x, r.y, r.width + 1, r.height);
-                        });
-                        return GLib.SOURCE_REMOVE;
-                    });
-                }
-            } else {
-                this._ext.nudgeCSD(win, false);
-            }
-        });
-
-        /* Late-enforce for slow apps that re-negotiate size */
-        this._ext._defer(400, () => {
-            if (!win || win.get_maximized()) return;
-            const fr = _safe(() => win.get_frame_rect());
-            const tgt2 = this._ext._targetRect(win);
-            if (fr && tgt2 && !rectsMatch(fr, tgt2))
-                _safe(() => win.move_resize_frame(true,
-                    tgt2.x, tgt2.y, tgt2.width, tgt2.height));
-        });
-    }
-
-    /** Normal MAX/nativeUnmax dispatch. */
-    _processMaxChange(win) {
-        if (!win) return;
-        const s = ws(win);
-        if (!s.tracked) return;
-
-        const isMax = win.get_maximized() === Meta.MaximizeFlags.BOTH;
-        if (isMax === !!s.wasMax) return;
-        s.wasMax = isMax;
-
-        this._refresh();
-
-        if (isMax) {
-            /* MAX: deferred layout + decoration handling after native animation */
-            s.animating = false;
-            this._ext._defer(300, () => {
-                if (!win || !win.get_maximized()) return;
-                if (_isX11(win))
-                    this._ext.applyXprop(win, true);
-                this._ext.updateLayout(true);
-                if (!_isX11(win))
-                    this._ext.nudgeCSD(win, true);
-            });
-        } else {
-            /* UNMAX nativeUnmax only (override is handled above) */
-            if (!s.nativeUnmax) return;
-            s.animating = false;
-            s.nativeUnmax = false;
-            s.preMaxRect = null;
-
-            if (_isX11(win)) {
-                /* XWayland: xprop(restore) deferred to AFTER animation */
-                this._ext._defer(300, () => {
-                    if (!win || win.get_maximized()) return;
-                    this._ext.applyXprop(win, false);
-                    const csdNow = _hasCSD(win);
-                    if (csdNow !== s.isCSD) {
-                        s.isCSD = csdNow;
-                        this._ext.applyXprop(win, false);
-                    }
-                });
-            } else {
-                /* Wayland-native: layout + deferred CSD nudge */
-                this._ext.updateLayout(false);
-                this._ext._defer(300, () => {
-                    if (!win || win.get_maximized()) return;
-                    this._ext.nudgeCSD(win, false);
-                });
-            }
-        }
-    }
-
-    /* ── Map — initial window centering ──────────────────────────────── */
-
-    /**
-     * On window map, enforces minimum size and centered placement.
-     * Under Wayland, GNOME handles the map animation natively.
-     */
-    _onMap(actor) {
+    for (let i = 0; i < all.length; i++) {
         try {
-            const win = actor?.meta_window;
-            if (!win) return;
-            const pct = this._s.get_int('min-open-size-percent');
-            if (!pct || pct <= 0) return;
-            const s = ws(win);
-            if (s.mapHandled || win.get_maximized()) return;
-            if (win.get_window_type() !== Meta.WindowType.NORMAL) return;
-            if (win.get_transient_for()) return;
-            if (DESKTOP_WM.has(s.wmClass)) return;
-            if (win.is_skip_taskbar?.() || win.skip_taskbar) return;
-            s.mapHandled = true;
-            this._enforceMinSize(win, pct);
-        } catch (_) {}
-    }
+            const info = _toAppInfo(all[i]);
 
-    /**
-     * Polls until the window has a valid frame, then moves/resizes it to
-     * the centered target.
-     */
-    _enforceMinSize(win, pct) {
-        const s = ws(win);
-        let retries = 0;
-        const MAX_RETRIES = 15, POLL_MS = 50;
+            const id = info.get_id?.() ?? null;
+            if (!id) continue;
 
-        const mapDone = () => {
-            if (s.mapCleanup)   { s.mapCleanup(); s.mapCleanup = null; }
-            if (s.mapTimeoutId) { GLib.source_remove(s.mapTimeoutId); s.mapTimeoutId = 0; }
-            this._activate(win);
-        };
+            // should_show() is the same check GNOME's launcher uses:
+            // NoDisplay, Hidden, OnlyShowIn, valid Exec...
+            try {
+                if (typeof info.should_show === 'function' && !info.should_show())
+                    continue;
+                else if (typeof info.get_nodisplay === 'function' && info.get_nodisplay())
+                    continue;
+            } catch (_) { /* assume visible */ }
 
-        const computeTarget = () => {
-            const wa = _safe(() => Main.layoutManager.getWorkAreaForMonitor(win.get_monitor()));
-            if (!wa || wa.width < 100) return null;
-            const r = _safe(() => win.get_frame_rect());
-            if (!r) return null;
-            const nw = Math.max(r.width,  Math.floor(wa.width  * pct / 100));
-            const nh = Math.max(r.height, Math.floor(wa.height * pct / 100));
-            return {
-                x: wa.x + Math.floor((wa.width  - nw) / 2),
-                y: wa.y + Math.floor((wa.height - nh) / 2),
-                width: nw, height: nh,
-            };
-        };
+            const name = info.get_name?.() || info.get_display_name?.() || null;
+            if (!name) continue;
 
-        const poll = () => {
-            if (!win) return;
-            const r = _safe(() => win.get_frame_rect());
-            if (!r || r.width < 10 || r.height < 10) {
-                if (++retries >= MAX_RETRIES) { mapDone(); return; }
-                s.mapTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, POLL_MS, () => {
-                    s.mapTimeoutId = 0; poll(); return GLib.SOURCE_REMOVE;
-                });
-                return;
+            let categories = '';
+            try { categories = info.get_categories() || ''; } catch (_) { /**/ }
+            if (_onlySystemCats(categories)) continue;
+            if (_isSystemId(id)) continue;
+
+            let iconName = 'application-x-executable';
+            try {
+                const ic = info.get_icon();
+                if (ic) iconName = ic.to_string();
+            } catch (_) { /**/ }
+
+            const baseId = id.replace(/\.desktop$/, '');
+            let source = 'deb', uninstallId = baseId;
+            let desktopPath = '';
+            try { desktopPath = info.get_filename() || ''; } catch (_) { /**/ }
+
+            if (fpIds.has(baseId)) {
+                source = 'flatpak';
+                uninstallId = baseId;
+            } else {
+                let matched = false;
+                if (desktopPath.includes('/snap/') || desktopPath.includes('/snapd/')) {
+                    const cand = GLib.path_get_basename(desktopPath).split('_')[0];
+                    if (snaps.has(cand.toLowerCase())) {
+                        source = 'snap';
+                        uninstallId = snaps.get(cand.toLowerCase());
+                        matched = true;
+                    }
+                }
+                if (!matched) {
+                    const nameLc = name.toLowerCase().replace(/\s+/g, '-');
+                    if (snaps.has(nameLc)) {
+                        source = 'snap';
+                        uninstallId = snaps.get(nameLc);
+                    } else if (snaps.has(baseId.toLowerCase())) {
+                        source = 'snap';
+                        uninstallId = snaps.get(baseId.toLowerCase());
+                    }
+                }
             }
-            const tgt = computeTarget();
-            if (!tgt || rectsMatch(r, tgt)) { mapDone(); return; }
 
-            _safe(() => win.move_resize_frame(true, tgt.x, tgt.y, tgt.width, tgt.height));
-            s.mapTimeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, POLL_MS, () => {
-                s.mapTimeoutId = 0;
-                mapDone();
-                this._ext._defer(200, () => {
-                    if (!win || win.get_maximized()) return;
-                    const fr = _safe(() => win.get_frame_rect());
-                    const tgt2 = computeTarget();
-                    if (fr && tgt2 && !rectsMatch(fr, tgt2))
-                        _safe(() => win.move_resize_frame(true, tgt2.x, tgt2.y, tgt2.width, tgt2.height));
-                });
-                return GLib.SOURCE_REMOVE;
-            });
-        };
+            results.push({name, iconName, source, uninstallId, desktopId: id, desktopPath});
+        } catch (_) {
+            continue;
+        }
+    }
 
-        this._idle(GLib.PRIORITY_HIGH, () => { poll(); return GLib.SOURCE_REMOVE; });
-        this._safety(2000, () => {
-            if (s.mapCleanup)   { s.mapCleanup(); s.mapCleanup = null; }
-            if (s.mapTimeoutId) { GLib.source_remove(s.mapTimeoutId); s.mapTimeoutId = 0; }
+    return results.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+
+// -- Confirm dialog ---------------------------------------------------------
+
+const ConfirmDialog = GObject.registerClass(
+class ConfirmDialog extends ModalDialog.ModalDialog {
+    _init(appName, source, pkgId, onConfirm) {
+        super._init({styleClass: 'app-manager-confirm-dialog'});
+
+        const box = new St.BoxLayout({
+            vertical: true,
+            style: 'spacing:12px; padding:20px; min-width:300px;',
         });
-    }
+        this.contentLayout.add_child(box);
 
-    /** Focuses the window, with fallback for special window types. */
-    _activate(win) {
-        if (!win || win.minimized) return;
-        _safe(() => Main.activateWindow(win))
-            ?? _safe(() => win.activate(global.get_current_time()));
-    }
+        box.add_child(new St.Label({
+            text: `Uninstall "${appName}"?`,
+            style: 'font-size:16px; font-weight:bold; text-align:center;',
+            x_align: Clutter.ActorAlign.CENTER,
+        }));
+        box.add_child(new St.Label({
+            text: `Source: ${source.toUpperCase()}\nPackage: ${pkgId}\n\nYour password will be required.`,
+            style: 'font-size:13px; text-align:center; color:#aaa;',
+            x_align: Clutter.ActorAlign.CENTER,
+        }));
 
-    /* ── Panel visibility ────────────────────────────────────────────── */
-
-    /**
-     * Updates the indicator's visibility and the button-layout based on
-     * the currently focused window. Always restores button-layout when
-     * a non-maximized window gets focus (prevents "stuck hidden buttons"
-     * from the previous maximized window).
-     */
-    _refresh() {
-        const win = global.display.get_focus_window();
-        if (!win || win.minimized
-            || win.get_window_type() !== Meta.WindowType.NORMAL
-            || DESKTOP_WM.has(ws(win).wmClass)
-            || Main.overview.visible
-            || !win.located_on_workspace(
-                   global.workspace_manager.get_active_workspace())
-            || win.skip_taskbar) {
-            this.visible = false;
-            this._ext.updateLayout(false);
-            this._disconnTitle();
-            return;
-        }
-        const isMax = win.get_maximized() === Meta.MaximizeFlags.BOTH;
-        this.visible = isMax;
-        if (isMax) this._title.text = win.get_title() || '';
-
-        /* Sync button-layout with the focused window's state.
-         * Non-max: restore buttons immediately (prevents "stuck hidden" contamination).
-         * Already-max: hide buttons (focus switched to an already-maximized window,
-         *   e.g. after unmaximizing another one — no animation is running). */
-        this._ext.updateLayout(isMax);
-
-        if (isMax && win !== this._titleWin) {
-            this._disconnTitle();
-            this._titleWin = win;
-            this._titleSig = win.connect('notify::title', () => {
-                if (this.visible) this._title.text = win.get_title() || '';
-            });
-        } else if (!isMax) {
-            this._disconnTitle();
-        }
-    }
-
-    _disconnTitle() {
-        if (this._titleSig && this._titleWin) {
-            _safe(() => this._titleWin.disconnect(this._titleSig));
-            this._titleSig = 0;
-            this._titleWin = null;
-        }
-    }
-
-    destroy() {
-        this._disconnTitle();
-        for (const [o, id] of this._sigs)
-            _safe(() => o.disconnect(id));
-        this._sigs.length = 0;
-        for (const id of this._safeties)
-            _safe(() => GLib.source_remove(id));
-        this._safeties.clear();
-        for (const id of this._sources)
-            _safe(() => GLib.source_remove(id));
-        this._sources.clear();
-        for (const a of global.get_window_actors()) {
-            if (a.meta_window) this._untrack(a.meta_window);
-            if (!a.visible) a.show();
-            if (a.opacity < 255) a.opacity = 255;
-        }
-        /* Release owned references (EGO-L-005) */
-        this._safeties = null;
-        this._sources  = null;
-        this._s        = null;
-        this._ext      = null;
-        super.destroy();
+        this.setButtons([
+            {label: 'Cancel', action: () => this.close(), key: Clutter.KEY_Escape},
+            {label: 'Uninstall', action: () => { this.close(); onConfirm(); }, default: true},
+        ]);
     }
 });
 
 
-/* ═══════════════════════════════════════════════════════════════════════
-   EXTENSION MAIN CLASS
-   ═══════════════════════════════════════════════════════════════════════ */
+// -- Application window -----------------------------------------------------
 
-export default class UnityButtonsExtension extends Extension {
+const AppWindow = GObject.registerClass({
+    Signals: {'closed': {}},
+}, class AppWindow extends St.BoxLayout {
+
+    _init() {
+        super._init({
+            vertical: true, visible: false, reactive: true,
+            style_class: 'app-manager-window',
+        });
+        this._apps = [];
+        this._filter = 'all';
+        this._search = '';
+        this._cancellable = null;
+        this._buildUI();
+    }
+
+    _buildUI() {
+        const header = new St.BoxLayout({style_class: 'app-manager-header'});
+        this.add_child(header);
+        header.add_child(new St.Icon({
+            icon_name: 'view-grid-symbolic', icon_size: 22,
+            style: 'margin-right:10px;',
+        }));
+        header.add_child(new St.Label({
+            text: 'Applications', style_class: 'app-manager-title',
+            y_align: Clutter.ActorAlign.CENTER, x_expand: true,
+        }));
+        const close = new St.Button({
+            style_class: 'app-manager-close-btn',
+            child: new St.Icon({icon_name: 'window-close-symbolic', icon_size: 16}),
+        });
+        close.connect('clicked', () => this.close());
+        header.add_child(close);
+
+        this._entry = new St.Entry({
+            hint_text: '  Search applications…',
+            style_class: 'app-manager-search', can_focus: true,
+        });
+        this._entry.get_clutter_text().connect('text-changed', () => {
+            this._search = this._entry.get_text();
+            this._fill();
+        });
+        this.add_child(this._entry);
+
+        const bar = new St.BoxLayout({style_class: 'app-manager-filters'});
+        this.add_child(bar);
+        this._btns = {};
+        for (const {key, label} of [
+            {key: 'all', label: 'All'}, {key: 'deb', label: 'Deb'},
+            {key: 'flatpak', label: 'Flatpak'}, {key: 'snap', label: 'Snap'},
+        ]) {
+            const b = new St.Button({
+                label, style_class: 'app-manager-filter-btn', toggle_mode: true,
+            });
+            if (key === 'all') b.checked = true;
+            b.connect('clicked', () => {
+                this._filter = key;
+                Object.entries(this._btns).forEach(([k, v]) => { v.checked = k === key; });
+                this._fill();
+            });
+            bar.add_child(b);
+            this._btns[key] = b;
+        }
+
+        this._count = new St.Label({text: '', style_class: 'app-manager-count'});
+        this.add_child(this._count);
+
+        const scroll = new St.ScrollView({
+            style_class: 'app-manager-scroll',
+            overlay_scrollbars: true, x_expand: true, y_expand: true,
+        });
+        this.add_child(scroll);
+        this._list = new St.BoxLayout({
+            vertical: true, style_class: 'app-manager-list', x_expand: true,
+        });
+        scroll.set_child(this._list);
+    }
+
+    open() {
+        this.show();
+        this._entry.set_text('');
+        this._filter = 'all';
+        Object.entries(this._btns).forEach(([k, b]) => { b.checked = k === 'all'; });
+        this._count.text = 'Loading…';
+        this._list.destroy_all_children();
+
+        const mon = Main.layoutManager.primaryMonitor;
+        const pH = Main.panel.get_height();
+        const w = 460, h = Math.min(mon.height - pH - 40, 700);
+        this.set_size(w, h);
+        this.set_position(mon.x + mon.width - w - 12, mon.y + pH + 6);
+
+        // Cancel any in-flight load (e.g. user closed and reopened quickly).
+        this._cancelLoad();
+        const cancellable = new Gio.Cancellable();
+        this._cancellable = cancellable;
+
+        _collectApps(cancellable).then(apps => {
+            // Bail if this load was cancelled or superseded by another open().
+            if (cancellable.is_cancelled() || this._cancellable !== cancellable)
+                return;
+            this._cancellable = null;
+            this._apps = apps;
+            this._fill();
+            global.stage.set_key_focus(this._entry);
+        }).catch(() => { /* swallow — cancellation or unexpected */ });
+    }
+
+    close() {
+        this._cancelLoad();
+        this.hide();
+        this.emit('closed');
+    }
+
+    _cancelLoad() {
+        if (this._cancellable) {
+            this._cancellable.cancel();
+            this._cancellable = null;
+        }
+    }
+
+    _fill() {
+        this._list.destroy_all_children();
+        const q = this._search.toLowerCase();
+        let n = 0;
+        for (const app of this._apps) {
+            if (this._filter !== 'all' && app.source !== this._filter) continue;
+            if (q && !app.name.toLowerCase().includes(q)) continue;
+            this._list.add_child(this._row(app));
+            n++;
+        }
+        this._count.text = `${n} application${n !== 1 ? 's' : ''}`;
+    }
+
+    _row(d) {
+        const row = new St.BoxLayout({
+            style_class: 'app-manager-row',
+            reactive: true, track_hover: true, x_expand: true,
+        });
+        row.add_child(new St.Icon({
+            icon_name: d.iconName, icon_size: 32,
+            style_class: 'app-manager-icon',
+            fallback_icon_name: 'application-x-executable',
+        }));
+
+        const col = new St.BoxLayout({vertical: true, x_expand: true, style: 'spacing:3px;'});
+        col.add_child(new St.Label({
+            text: d.name, style_class: 'app-manager-app-name',
+            x_align: Clutter.ActorAlign.START,
+        }));
+        col.add_child(new St.Label({
+            text: d.source.toUpperCase(),
+            style_class: `app-manager-badge app-manager-badge-${d.source}`,
+            x_align: Clutter.ActorAlign.START,
+        }));
+        row.add_child(col);
+
+        const btn = new St.Button({
+            style_class: 'app-manager-uninstall-btn',
+            child: new St.Icon({icon_name: 'user-trash-symbolic', icon_size: 16}),
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        btn.connect('clicked', () => {
+            this.close();
+            new ConfirmDialog(d.name, d.source, d.uninstallId, () => {
+                this._uninstall(d).catch(() => { /* ignore */ });
+            }).open(global.get_current_time());
+        });
+        row.add_child(btn);
+        return row;
+    }
+
+    async _uninstall(d) {
+        let argv;
+        switch (d.source) {
+        case 'flatpak':
+            argv = ['flatpak', 'uninstall', '--noninteractive', '-y', d.uninstallId];
+            break;
+        case 'snap':
+            // pkexec is required per EGO guidelines for privileged subprocesses
+            argv = ['pkexec', 'snap', 'remove', d.uninstallId];
+            break;
+        case 'deb': {
+            let pkg = d.uninstallId;
+            if (d.desktopPath) {
+                const resolved = await _debPkgForDesktop(d.desktopPath);
+                if (resolved) pkg = resolved;
+            }
+            if (await _isProtectedDeb(pkg)) {
+                Main.notify('App Manager Remover',
+                    `${d.name} is a protected system package.`);
+                return;
+            }
+            // pkexec is required per EGO guidelines for privileged subprocesses
+            argv = ['pkexec', 'apt', 'remove', '-y', pkg];
+            break;
+        }
+        default: return;
+        }
+        Main.notify('App Manager Remover', `Uninstalling ${d.name}…`);
+        _spawnDetached(argv);
+    }
+
+    vfunc_key_press_event(event) {
+        if (event.get_key_symbol() === Clutter.KEY_Escape) {
+            this.close();
+            return Clutter.EVENT_STOP;
+        }
+        return Clutter.EVENT_PROPAGATE;
+    }
+});
+
+
+// -- Backdrop ---------------------------------------------------------------
+
+const Backdrop = GObject.registerClass(
+class Backdrop extends St.Widget {
+    _init(win) {
+        super._init({reactive: true, visible: false});
+        this._win = win;
+    }
+    vfunc_button_press_event() {
+        this._win.close();
+        return Clutter.EVENT_STOP;
+    }
+});
+
+
+// -- Panel button -----------------------------------------------------------
+
+const Indicator = GObject.registerClass(
+class Indicator extends PanelMenu.Button {
+    _init(win, bk) {
+        super._init(0.0, 'App Manager Remover', true);
+        this._win = win;
+        this._bk = bk;
+        this.add_child(new St.Icon({
+            icon_name: 'view-grid-symbolic', style_class: 'system-status-icon',
+        }));
+    }
+
+    vfunc_event(event) {
+        if (event.type() === Clutter.EventType.BUTTON_PRESS ||
+            event.type() === Clutter.EventType.TOUCH_BEGIN) {
+            this._toggle();
+            return Clutter.EVENT_STOP;
+        }
+        return Clutter.EVENT_PROPAGATE;
+    }
+
+    _toggle() {
+        if (this._win.visible) {
+            this._win.close();
+        } else {
+            const m = Main.layoutManager.primaryMonitor;
+            this._bk.set_position(m.x, m.y + Main.panel.get_height());
+            this._bk.set_size(m.width, m.height);
+            this._bk.show();
+            this._win.open();
+        }
+    }
+});
+
+
+// -- Extension lifecycle ----------------------------------------------------
+
+export default class AppManagerRemoverExtension extends Extension {
 
     enable() {
-        this._settings       = this.getSettings();
-        this._wmSettings     = new Gio.Settings({ schema_id: 'org.gnome.desktop.wm.preferences' });
-        this._mutterSettings = new Gio.Settings({ schema_id: 'org.gnome.mutter' });
-        this._updatingCount  = 0;
-        this._deferIds       = new Set();
-        this._wmSigId        = 0;
-        this._minSizeSigId   = 0;
+        this._win = new AppWindow();
+        this._bk = new Backdrop(this._win);
 
-        /* Layout persistence: stored only in GSettings (`original-layout-cache`).
-         * No file cache — synchronous IO would violate EGO-X-004. */
-        const cur = this._wmSettings.get_string('button-layout');
-        if (cur !== ':') {
-            this._layout = cur;
-            this._settings.set_string('original-layout-cache', cur);
-        } else {
-            this._layout = this._settings.get_string('original-layout-cache')
-                || 'close,minimize,maximize:';
-        }
-        this._wmSigId = this._wmSettings.connect('changed::button-layout', () => {
-            if (this._updatingCount) return;
-            const v = this._wmSettings.get_string('button-layout');
-            if (v && v !== ':') {
-                this._layout = v;
-                this._settings.set_string('original-layout-cache', v);
-            }
-        });
+        this._closedId = this._win.connect('closed', () => this._bk.hide());
 
-        this._origCenter = this._mutterSettings.get_boolean('center-new-windows');
-        this._applyCenter();
-        this._minSizeSigId = this._settings.connect(
-            'changed::min-open-size-percent', () => this._applyCenter());
+        Main.layoutManager.addTopChrome(this._bk);
+        Main.layoutManager.addTopChrome(this._win);
 
-        /* Fire-and-forget — async file IO, EGO-X-004 compliant */
-        this._applyGtkHack(true);
-        this._indicator = new UnityButtons(this._settings, this);
-        Main.panel.addToStatusArea('unity-buttons', this._indicator, 0, 'left');
+        this._indicator = new Indicator(this._win, this._bk);
+        Main.panel.addToStatusArea('app-manager-remover', this._indicator);
     }
 
     disable() {
-        if (this._wmSigId)      _safe(() => this._wmSettings.disconnect(this._wmSigId));
-        if (this._minSizeSigId) _safe(() => this._settings.disconnect(this._minSizeSigId));
-        this._wmSigId      = 0;
-        this._minSizeSigId = 0;
-
-        _safe(() => this._mutterSettings.set_boolean('center-new-windows', this._origCenter));
-
-        /* Fire-and-forget async IO — EGO-X-004 compliant */
-        this._applyGtkHack(false);
-
-        const saved = this._settings?.get_string('original-layout-cache');
-        if (saved && saved !== ':') {
-            this._updatingCount++;
-            _safe(() => this._wmSettings.set_string('button-layout', saved));
-            this._updatingCount--;
+        if (this._closedId) {
+            this._win.disconnect(this._closedId);
+            this._closedId = 0;
         }
 
-        /* Remove every tracked main loop source (EGO-L-004) */
-        for (const id of this._deferIds)
-            _safe(() => GLib.source_remove(id));
-        this._deferIds.clear();
+        // Cancel any in-flight subprocess listing.
+        this._win._cancelLoad();
 
-        if (this._indicator) { this._indicator.destroy(); this._indicator = null; }
-
-        /* Release every owned reference (EGO-L-005) */
-        this._settings       = null;
-        this._wmSettings     = null;
-        this._mutterSettings = null;
-        this._deferIds       = null;
-        this._layout         = null;
-        this._origCenter     = null;
-        this._updatingCount  = 0;
-    }
-
-    /** Tracked deferred timeout — auto-cleaned at disable(). */
-    _defer(ms, fn) {
-        const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
-            this._deferIds.delete(id);
-            _safe(fn);
-            return GLib.SOURCE_REMOVE;
-        });
-        this._deferIds.add(id);
-        return id;
-    }
-
-    _applyCenter() {
-        const pct = this._settings.get_int('min-open-size-percent');
-        this._mutterSettings.set_boolean('center-new-windows',
-            pct > 0 || this._origCenter);
-    }
-
-    _getWorkArea(win) {
-        return _safe(() => Main.layoutManager.getWorkAreaForMonitor(win.get_monitor()));
-    }
-
-    /** Computes the centered target rect based on window-size-percent. */
-    _targetRect(win) {
-        const wa = this._getWorkArea(win);
-        if (!wa) return null;
-        const pct = this._settings?.get_int('window-size-percent') || 80;
-        const w = Math.min(Math.floor(wa.width  * pct / 100), wa.width);
-        const h = Math.min(Math.floor(wa.height * pct / 100), wa.height);
-        return {
-            x: wa.x + Math.floor((wa.width  - w) / 2),
-            y: wa.y + Math.floor((wa.height - h) / 2),
-            width: w, height: h,
-        };
-    }
-
-    /* ═══════════════════════════════════════════════════════════════════
-       ANIMATION HELPERS
-       ═══════════════════════════════════════════════════════════════════ */
-
-    /** Cancels all pending animations/timers and restores the actor. */
-    _cancelAnim(win) {
-        const s = ws(win);
-        s.animating = false;
-        const a = win.get_compositor_private?.();
-        if (a) {
-            a.remove_all_transitions();
-            a.set_scale(1, 1);
-            a.set_pivot_point(0, 0);
-            a.translation_x = 0;
-            a.translation_y = 0;
-            a.show();
-            a.opacity = 255;
+        if (this._indicator) {
+            this._indicator.destroy();
+            this._indicator = null;
         }
-    }
-
-    /**
-     * Overwrites Mutter's internal saved_rect by performing a synchronous
-     * maximize→suppress→unmaximize→suppress cycle. All calls execute in
-     * a single JS tick, so Clutter renders zero intermediate frames.
-     *
-     * Pre-condition: window is non-maximized and positioned at targetRect.
-     * Post-condition: saved_rect = tgt, window at tgt, non-maximized.
-     */
-    _poisonSavedRect(win, s, tgt) {
-        const actor = win.get_compositor_private?.();
-        if (!actor || s.poisoning) return;
-
-        s.poisoning = true;
-
-        const suppress = () => {
-            actor.remove_all_transitions();
-            _safe(() => global.window_manager.completed_size_change(actor));
-            _safe(() => Main.wm._resizing?.delete(actor));
-            _safe(() => Main.wm._resizePending?.delete(actor));
-            actor.set_scale(1, 1);
-            actor.set_pivot_point(0, 0);
-            actor.opacity = 255;
-        };
-
-        try {
-            /* maximize → Mutter saves current position (= tgt) as saved_rect */
-            win.maximize(Meta.MaximizeFlags.BOTH);
-            suppress();
-            /* unmaximize → Mutter restores to saved_rect (= tgt) */
-            win.unmaximize(Meta.MaximizeFlags.BOTH);
-            suppress();
-            /* Ensure window is at tgt */
-            _safe(() => win.move_resize_frame(true,
-                tgt.x, tgt.y, tgt.width, tgt.height));
-        } catch (_) {}
-
-        s.poisoning = false;
-        s.wasMax = false;
-        s.preMaxRect = snapRect(tgt);
-
-        if (s.debounceId) {
-            GLib.source_remove(s.debounceId);
-            s.debounceId = 0;
+        if (this._win) {
+            Main.layoutManager.removeChrome(this._win);
+            this._win.destroy();
+            this._win = null;
         }
-    }
-
-    /* ── Layout management ───────────────────────────────────────────── */
-
-    /** Sets button-layout to ':' (hidden) or restores the original. */
-    updateLayout(hide) {
-        const want = hide ? ':' : this._layout;
-        if (this._wmSettings?.get_string('button-layout') !== want) {
-            this._updatingCount++;
-            this._wmSettings.set_string('button-layout', want);
-            this._updatingCount--;
+        if (this._bk) {
+            Main.layoutManager.removeChrome(this._bk);
+            this._bk.destroy();
+            this._bk = null;
         }
-    }
-
-    /** Forces a layout refresh via dummy→real toggle (for CSD apps). */
-    forceLayoutRefresh(hide) {
-        const want  = hide ? ':' : this._layout;
-        const dummy = hide ? ':close' : ':';
-        this._updatingCount++;
-        this._wmSettings.set_string('button-layout', dummy);
-        this._defer(30, () => {
-            if (this._wmSettings)
-                this._wmSettings.set_string('button-layout', want);
-            this._updatingCount--;
-        });
-    }
-
-    /* ── XWayland: decoration control via xprop ────────────────────────── */
-
-    /**
-     * Hides or restores WM decorations on XWayland windows using _MOTIF_WM_HINTS.
-     * No-op on native Wayland windows (they use button-layout manipulation).
-     *
-     * Hide:    set hints to "no decorations" (2, 0, 0, 0, 0)
-     * Restore: CSD apps → remove hints; SSD apps → set hints to "decorations on" (2, 0, 1, 0, 0)
-     */
-    applyXprop(win, hide) {
-        if (!_isX11(win)) return;
-        if (ws(win).wmClass.includes('vlc')) return;
-        let xid;
-        _safe(() => { xid = win.get_xwindow(); });
-        if (!xid) return;
-        const xidHex = '0x' + xid.toString(16);
-        const flags = Gio.SubprocessFlags.STDOUT_SILENCE |
-                      Gio.SubprocessFlags.STDERR_SILENCE;
-        _safe(() => {
-            if (hide) {
-                Gio.Subprocess.new(
-                    ['xprop', '-id', xidHex, '-f', '_MOTIF_WM_HINTS', '32c',
-                     '-set', '_MOTIF_WM_HINTS', '2, 0, 0, 0, 0'], flags);
-            } else if (ws(win).isCSD) {
-                Gio.Subprocess.new(
-                    ['xprop', '-id', xidHex, '-remove', '_MOTIF_WM_HINTS'], flags);
-            } else {
-                Gio.Subprocess.new(
-                    ['xprop', '-id', xidHex, '-f', '_MOTIF_WM_HINTS', '32c',
-                     '-set', '_MOTIF_WM_HINTS', '2, 0, 1, 0, 0'], flags);
-            }
-        });
-    }
-
-    /* ── CSD nudge ───────────────────────────────────────────────────── */
-
-    /**
-     * Works around CSD apps that don't redraw their decorations after
-     * a layout change. Triggers a dummy resize to force a redraw.
-     */
-    nudgeCSD(win, afterMax) {
-        /* XWayland windows use xprop, not button-layout CSD nudge */
-        if (_isX11(win)) return;
-        const fr = _safe(() => win.get_frame_rect());
-        const br = _safe(() => win.get_buffer_rect());
-        if (!fr || !br) return;
-        if (Math.abs(fr.width - br.width) >= 5 ||
-            Math.abs(fr.height - br.height) >= 5) return;
-        const s = ws(win);
-        if (s.nudgeCleanup) { s.nudgeCleanup(); s.nudgeCleanup = null; }
-        s.nudgeCleanup = onceSignal(win, 'size-changed', () => {
-            s.nudgeCleanup = null;
-            this.forceLayoutRefresh(afterMax);
-            if (!afterMax && !win.get_maximized()) {
-                _safe(() => {
-                    const r = win.get_frame_rect();
-                    win.move_resize_frame(true, r.x, r.y, r.width - 1, r.height);
-                });
-                this._indicator?._idle(GLib.PRIORITY_DEFAULT_IDLE, () => {
-                    if (!win || win.get_maximized()) return GLib.SOURCE_REMOVE;
-                    _safe(() => {
-                        const r = win.get_frame_rect();
-                        win.move_resize_frame(true, r.x, r.y, r.width + 1, r.height);
-                    });
-                    return GLib.SOURCE_REMOVE;
-                });
-            }
-        }, afterMax
-            ? () => win.get_maximized() === Meta.MaximizeFlags.BOTH
-            : () => !win.get_maximized());
-    }
-
-    /* ── GTK3 CSS hack for LibreOffice ───────────────────────────────── */
-
-    /**
-     * Injects/removes CSS into ~/.config/gtk-3.0/gtk.css to hide the
-     * LibreOffice headerbar when maximized. Wrapped in marker comments
-     * for clean removal on disable().
-     *
-     * Uses async file IO (EGO-X-004 compliant). Caller does not need to
-     * await — the operation is fire-and-forget.
-     */
-    async _applyGtkHack(on) {
-        try {
-            const dir = GLib.build_filenamev([GLib.get_user_config_dir(), 'gtk-3.0']);
-            GLib.mkdir_with_parents(dir, 0o755);
-            const file = Gio.File.new_for_path(GLib.build_filenamev([dir, 'gtk.css']));
-            let css = '';
-            if (file.query_exists(null)) {
-                try {
-                    const [contents] = await file.load_contents_async(null);
-                    css = new TextDecoder().decode(contents);
-                } catch (_) { /* fall through with empty css */ }
-            }
-            css = css.replace(
-                /\/\* --- UNITY-HACK --- \*\/[\s\S]*?\/\* --- END-UNITY-HACK --- \*\//g, ''
-            ).trim();
-            if (on) css += '\n\n/* --- UNITY-HACK --- */\n' + LO_HACK + '\n/* --- END-UNITY-HACK --- */';
-            const bytes = new TextEncoder().encode(css.trim());
-            await file.replace_contents_async(bytes, null, false,
-                Gio.FileCreateFlags.REPLACE_DESTINATION, null);
-        } catch (_) { /* silent — hack is best-effort */ }
     }
 }
