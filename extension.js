@@ -265,7 +265,17 @@ async function _collectApps(cancellable) {
             let desktopPath = '';
             try { desktopPath = info.get_filename() || ''; } catch (_) { /**/ }
 
-            if (fpIds.has(baseId)) {
+            // Apps installed by their own script (not deb/flatpak/snap) can
+            // advertise how to remove themselves via a custom desktop key,
+            // e.g. `X-Uninstall-Exec=/path/to/uninstall.sh`. Checked first:
+            // takes priority over the deb/flatpak/snap heuristics below.
+            let customExec = '';
+            try { customExec = info.get_string('X-Uninstall-Exec') || ''; } catch (_) { /* key absent */ }
+
+            if (customExec) {
+                source = 'custom';
+                uninstallId = customExec;
+            } else if (fpIds.has(baseId)) {
                 source = 'flatpak';
                 uninstallId = baseId;
             } else {
@@ -318,8 +328,11 @@ class ConfirmDialog extends ModalDialog.ModalDialog {
             style: 'font-size:16px; font-weight:bold; text-align:center;',
             x_align: Clutter.ActorAlign.CENTER,
         }));
+        const needsPassword = source === 'snap' || source === 'deb';
+        const idLabel = source === 'custom' ? 'Command' : 'Package';
         box.add_child(new St.Label({
-            text: `Source: ${source.toUpperCase()}\nPackage: ${pkgId}\n\nYour password will be required.`,
+            text: `Source: ${source.toUpperCase()}\n${idLabel}: ${pkgId}` +
+                (needsPassword ? '\n\nYour password will be required.' : ''),
             style: 'font-size:13px; text-align:center; color:#aaa;',
             x_align: Clutter.ActorAlign.CENTER,
         }));
@@ -384,6 +397,7 @@ const AppWindow = GObject.registerClass({
         for (const {key, label} of [
             {key: 'all', label: 'All'}, {key: 'deb', label: 'Deb'},
             {key: 'flatpak', label: 'Flatpak'}, {key: 'snap', label: 'Snap'},
+            {key: 'custom', label: 'Custom'},
         ]) {
             const b = new St.Button({
                 label, style_class: 'app-manager-filter-btn', toggle_mode: true,
@@ -531,6 +545,12 @@ const AppWindow = GObject.registerClass({
             argv = ['pkexec', 'apt', 'remove', '-y', pkg];
             break;
         }
+        case 'custom':
+            // Self-uninstalling app (script-based install, not a package
+            // manager) — the script already runs entirely in user-space,
+            // so no pkexec/root needed here.
+            argv = ['bash', d.uninstallId];
+            break;
         default: return;
         }
         Main.notify('App Manager Remover', `Uninstalling ${d.name}…`);
