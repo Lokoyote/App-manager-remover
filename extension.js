@@ -113,14 +113,28 @@ const _EX_PREFIXES = [
     'org.freedesktop.', 'org.gnome.settings', 'org.gnome.extensions',
     'org.gnome.terminal', 'org.gnome.console', 'org.gnome.nautilus',
     'org.gnome.systemmonitor', 'org.gnome.logs', 'org.gnome.diskutility',
-    'org.gnome.disks', 'org.gnome.font', 'org.gnome.characters',
+    'org.gnome.disks',
     'org.gnome.baobab', 'org.gnome.powerstats', 'org.gnome.firmware',
-    'org.gnome.tweaks', 'org.gnome.connections', 'org.gnome.clocks',
-    'org.gnome.weather', 'org.gnome.maps', 'org.gnome.contacts',
-    'org.gnome.calendar', 'org.gnome.snapshot', 'org.gnome.portal',
+    'org.gnome.tweaks', 'org.gnome.portal',
     'org.gnome.shell.', 'org.gnome.evolution-data', 'org.gtk.',
     'xdg-', 'snap:',
 ];
+
+// "Base apps" — common core GNOME apps that used to be hard-excluded above.
+// They're perfectly normal user-removable apps (Calendar, Contacts, Maps...)
+// so instead of hiding them we surface them under their own "Base" tab.
+const _BASE_PREFIXES = [
+    'org.gnome.calendar', 'org.gnome.contacts', 'org.gnome.maps',
+    'org.gnome.weather', 'org.gnome.clocks', 'org.gnome.characters',
+    'org.gnome.font', 'org.gnome.connections', 'org.gnome.snapshot',
+    'org.gnome.todo', 'org.gnome.calculator', 'org.gnome.texteditor',
+    'org.gnome.simple-scan', 'org.gnome.cheese',
+];
+
+function _isBaseApp(desktopId) {
+    const lc = desktopId.toLowerCase();
+    return _BASE_PREFIXES.some(p => lc.startsWith(p));
+}
 
 const _EX_INFIXES = [
     'nm-connection-editor', 'nm-applet', 'software-properties',
@@ -215,6 +229,75 @@ async function _debPkgForDesktop(path) {
 }
 
 
+// -- "Headless" deb packages (no .desktop launcher) -------------------------
+//
+// Some deb packages install nothing that GNOME's AppSystem can see — CLI
+// tools, or wrapper scripts like Nautilus's "Scripts" add-ons — so they
+// never show up in the main list above. `apt-mark showmanual` gives us
+// every package the user explicitly asked apt to install (as opposed to
+// pulled in automatically as a dependency), which is the same set apt's
+// own autoremove logic uses. We then drop anything that: is essential /
+// required / important / a well-known system section (same rule as
+// _isProtectedDeb, checked in bulk), or that *does* ship a .desktop file
+// (already visible in the "Deb" tab, so showing it here too would be a
+// duplicate).
+
+async function _manualDebPackages(cancellable) {
+    const out = await _spawnAsync(['apt-mark', 'showmanual'], cancellable);
+    return out ? out.split('\n').map(s => s.trim()).filter(Boolean) : [];
+}
+
+async function _hasDesktopFile(pkg, cancellable) {
+    const out = await _spawnAsync(['dpkg', '-L', pkg], cancellable);
+    if (!out) return false;
+    return out.split('\n').some(l =>
+        l.endsWith('.desktop') && (l.includes('/applications/') || l.includes('/autostart/')));
+}
+
+async function _headlessDebPackages(cancellable) {
+    const pkgs = await _manualDebPackages(cancellable);
+    if (!pkgs.length) return [];
+
+    // One bulk dpkg-query call for every candidate instead of one call per
+    // package — same priority/essential/section rule as _isProtectedDeb.
+    const out = await _spawnAsync([
+        'dpkg-query', '-W',
+        '-f=${Package}||||${Priority}||||${Essential}||||${Section}\n',
+        ...pkgs,
+    ], cancellable);
+
+    const protectedSet = new Set();
+    if (out) {
+        for (const line of out.split('\n')) {
+            const [pkg, pri, ess, rawSec] = line.split('||||').map(s => (s || '').trim().toLowerCase());
+            if (!pkg) continue;
+            const sec = rawSec?.includes('/') ? rawSec.split('/').pop() : rawSec;
+            if (ess === 'yes' || pri === 'required' || pri === 'important' || _DEB_SYS_SECTIONS.has(sec))
+                protectedSet.add(pkg);
+        }
+    }
+
+    const candidates = pkgs.filter(p => !protectedSet.has(p.toLowerCase()));
+
+    // Check for a shipped .desktop file concurrently (this list is small
+    // enough, and it's only computed lazily when the "Packages" tab is
+    // opened for the first time).
+    const flags = await Promise.all(candidates.map(p => _hasDesktopFile(p, cancellable)));
+    if (cancellable.is_cancelled()) return [];
+
+    const results = [];
+    candidates.forEach((pkg, i) => {
+        if (flags[i]) return; // already shown in the "Deb" tab
+        results.push({
+            name: pkg, iconName: 'utilities-terminal-symbolic',
+            source: 'pkg', uninstallId: pkg, desktopId: null, desktopPath: '',
+            isBase: false,
+        });
+    });
+    return results.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+
 // -- App collection ---------------------------------------------------------
 
 async function _collectApps(cancellable) {
@@ -300,7 +383,10 @@ async function _collectApps(cancellable) {
                 }
             }
 
-            results.push({name, iconName, source, uninstallId, desktopId: id, desktopPath});
+            results.push({
+                name, iconName, source, uninstallId, desktopId: id, desktopPath,
+                isBase: _isBaseApp(id),
+            });
         } catch (_) {
             continue;
         }
@@ -328,7 +414,7 @@ class ConfirmDialog extends ModalDialog.ModalDialog {
             style: 'font-size:16px; font-weight:bold; text-align:center;',
             x_align: Clutter.ActorAlign.CENTER,
         }));
-        const needsPassword = source === 'snap' || source === 'deb';
+        const needsPassword = source === 'snap' || source === 'deb' || source === 'pkg';
         const idLabel = source === 'custom' ? 'Command' : 'Package';
         box.add_child(new St.Label({
             text: `Source: ${source.toUpperCase()}\n${idLabel}: ${pkgId}` +
@@ -360,6 +446,8 @@ const AppWindow = GObject.registerClass({
         this._filter = 'all';
         this._search = '';
         this._cancellable = null;
+        this._pkgApps = null;
+        this._pkgCancellable = null;
         this._buildUI();
     }
 
@@ -397,7 +485,8 @@ const AppWindow = GObject.registerClass({
         for (const {key, label} of [
             {key: 'all', label: 'All'}, {key: 'deb', label: 'Deb'},
             {key: 'flatpak', label: 'Flatpak'}, {key: 'snap', label: 'Snap'},
-            {key: 'custom', label: 'Custom'},
+            {key: 'custom', label: 'Custom'}, {key: 'base', label: 'Base'},
+            {key: 'packages', label: 'Packages'},
         ]) {
             const b = new St.Button({
                 label, style_class: 'app-manager-filter-btn', toggle_mode: true,
@@ -442,6 +531,8 @@ const AppWindow = GObject.registerClass({
 
         // Cancel any in-flight load (e.g. user closed and reopened quickly).
         this._cancelLoad();
+        this._cancelPkgLoad();
+        this._pkgApps = null;
         const cancellable = new Gio.Cancellable();
         this._cancellable = cancellable;
 
@@ -458,6 +549,7 @@ const AppWindow = GObject.registerClass({
 
     close() {
         this._cancelLoad();
+        this._cancelPkgLoad();
         this.hide();
         this.emit('closed');
     }
@@ -469,17 +561,59 @@ const AppWindow = GObject.registerClass({
         }
     }
 
+    _cancelPkgLoad() {
+        if (this._pkgCancellable) {
+            this._pkgCancellable.cancel();
+            this._pkgCancellable = null;
+        }
+    }
+
     _fill() {
         this._list.destroy_all_children();
         const q = this._search.toLowerCase();
+
+        if (this._filter === 'packages') {
+            this._fillPackages(q);
+            return;
+        }
+
         let n = 0;
         for (const app of this._apps) {
-            if (this._filter !== 'all' && app.source !== this._filter) continue;
+            if (this._filter === 'base') {
+                if (!app.isBase) continue;
+            } else if (this._filter !== 'all' && app.source !== this._filter) {
+                continue;
+            }
             if (q && !app.name.toLowerCase().includes(q)) continue;
             this._list.add_child(this._row(app));
             n++;
         }
         this._count.text = `${n} application${n !== 1 ? 's' : ''}`;
+    }
+
+    _fillPackages(q) {
+        if (this._pkgApps === null) {
+            this._count.text = 'Scanning packages…';
+            if (!this._pkgCancellable) {
+                const cancellable = new Gio.Cancellable();
+                this._pkgCancellable = cancellable;
+                _headlessDebPackages(cancellable).then(pkgs => {
+                    if (cancellable.is_cancelled() || this._pkgCancellable !== cancellable)
+                        return;
+                    this._pkgCancellable = null;
+                    this._pkgApps = pkgs;
+                    if (this._filter === 'packages') this._fill();
+                }).catch(() => { /* swallow — cancellation or unexpected */ });
+            }
+            return;
+        }
+        let n = 0;
+        for (const pkg of this._pkgApps) {
+            if (q && !pkg.name.toLowerCase().includes(q)) continue;
+            this._list.add_child(this._row(pkg));
+            n++;
+        }
+        this._count.text = `${n} package${n !== 1 ? 's' : ''}`;
     }
 
     _row(d) {
@@ -498,11 +632,20 @@ const AppWindow = GObject.registerClass({
             text: d.name, style_class: 'app-manager-app-name',
             x_align: Clutter.ActorAlign.START,
         }));
-        col.add_child(new St.Label({
+        const badgeRow = new St.BoxLayout({style: 'spacing:6px;'});
+        badgeRow.add_child(new St.Label({
             text: d.source.toUpperCase(),
             style_class: `app-manager-badge app-manager-badge-${d.source}`,
             x_align: Clutter.ActorAlign.START,
         }));
+        if (d.isBase) {
+            badgeRow.add_child(new St.Label({
+                text: 'BASE',
+                style_class: 'app-manager-badge app-manager-badge-base',
+                x_align: Clutter.ActorAlign.START,
+            }));
+        }
+        col.add_child(badgeRow);
         row.add_child(col);
 
         const btn = new St.Button({
@@ -543,6 +686,18 @@ const AppWindow = GObject.registerClass({
             }
             // pkexec is required per EGO guidelines for privileged subprocesses
             argv = ['pkexec', 'apt', 'remove', '-y', pkg];
+            break;
+        }
+        case 'pkg': {
+            // Headless package (no .desktop launcher) — already filtered
+            // for essential/required/important packages at scan time, but
+            // double-check here too since state may have changed since.
+            if (await _isProtectedDeb(d.uninstallId)) {
+                Main.notify('App Manager Remover',
+                    `${d.name} is a protected system package.`);
+                return;
+            }
+            argv = ['pkexec', 'apt', 'remove', '-y', d.uninstallId];
             break;
         }
         case 'custom':

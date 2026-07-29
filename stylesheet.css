@@ -156,6 +156,16 @@
     background-color: rgba(114, 86, 209, 0.55);
 }
 
+/* Base app (core GNOME apps: Calendar, Contacts, Maps...) — teal */
+.app-manager-badge-base {
+    background-color: rgba(23, 162, 184, 0.55);
+}
+
+/* Headless package — no .desktop launcher (CLI tools, Nautilus scripts...) — orange */
+.app-manager-badge-pkg {
+    background-color: rgba(214, 122, 30, 0.55);
+}
+
 /* ── Uninstall button (trash icon, right side of each row) ────── */
 
 .app-manager-uninstall-btn {
